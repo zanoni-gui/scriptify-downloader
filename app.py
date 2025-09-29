@@ -5,6 +5,7 @@ import yt_dlp
 
 app = Flask(__name__)
 
+# ------------------ Utils ------------------ #
 def _guess_mimetype(path: str) -> str:
     ext = pathlib.Path(path).suffix.lower()
     return {
@@ -16,12 +17,29 @@ def _guess_mimetype(path: str) -> str:
         ".mkv": "video/x-matroska",
     }.get(ext, "application/octet-stream")
 
+def _sanitize_cookies_text(txt: str) -> str:
+    """
+    Corrige colagens comuns (ex.: cabeçalho Netscape colado sem quebra de linha),
+    normaliza quebras e garante newline final.
+    """
+    t = txt.replace("\r\n", "\n").replace("\r", "\n")
+    # garante quebra antes de qualquer cabeçalho Netscape
+    t = t.replace("# Netscape HTTP Cookie File", "\n# Netscape HTTP Cookie File")
+    # comprime múltiplas quebras
+    while "\n\n\n" in t:
+        t = t.replace("\n\n\n", "\n\n")
+    if not t.endswith("\n"):
+        t += "\n"
+    return t
+
+# ---------------- Cookies helpers ---------------- #
 def _cookiefile_from_env_for(url: str) -> str | None:
     """
     Fallback: se o usuário NÃO enviar cookies no request,
-    tenta cookies por ambiente (útil para IG, e YT se você quiser manter)
-    - YTDLP_COOKIES_B64 (base64 do cookies.txt em Netscape) para YouTube
-    - IG_COOKIES_B64     (base64 do cookies.txt em Netscape) para Instagram
+    tenta cookies por ambiente (útil para IG e YT, se você quiser manter).
+    Variáveis:
+      - YTDLP_COOKIES_B64 (base64 do cookies.txt em Netscape) para YouTube
+      - IG_COOKIES_B64     (base64 do cookies.txt em Netscape) para Instagram
     """
     host = (urlparse(url).netloc or "").lower()
     var = None
@@ -29,8 +47,6 @@ def _cookiefile_from_env_for(url: str) -> str | None:
         var = "YTDLP_COOKIES_B64"
     elif "instagram.com" in host:
         var = "IG_COOKIES_B64"
-    else:
-        var = None
 
     if not var:
         return None
@@ -42,7 +58,9 @@ def _cookiefile_from_env_for(url: str) -> str | None:
     try:
         raw = base64.b64decode(b64)
         tf = tempfile.NamedTemporaryFile(delete=False)
-        tf.write(raw); tf.flush(); tf.close()
+        tf.write(raw)
+        tf.flush()
+        tf.close()
         return tf.name
     except Exception:
         return None
@@ -54,10 +72,14 @@ def _cookiefile_from_request(cookies_txt: str) -> str | None:
     """
     if not cookies_txt or not cookies_txt.strip():
         return None
+    txt = _sanitize_cookies_text(cookies_txt)  # <<< sanitiza aqui
     tf = tempfile.NamedTemporaryFile(delete=False)
-    tf.write(cookies_txt.encode("utf-8")); tf.flush(); tf.close()
+    tf.write(txt.encode("utf-8"))
+    tf.flush()
+    tf.close()
     return tf.name
 
+# ---------------- Core download ---------------- #
 def _download_best_audio(url: str, cookies_txt: str | None) -> str:
     """
     Baixa o melhor áudio possível do link. Tenta MP3 via ffmpeg;
@@ -93,54 +115,4 @@ def _download_best_audio(url: str, cookies_txt: str | None) -> str:
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/126.0.0.0 Safari/537.36"
             ),
-            "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Referer": referer,
-        },
-        "prefer_ffmpeg": True,
-        "ffmpeg_location": "/usr/bin/ffmpeg",
-        "postprocessors": [
-            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "0"}
-        ],
-        "extractor_args": {
-            "youtube": {"player_client": ["web", "android", "web_embedded", "ios"]},
-            "tiktok": {"download_api": ["Web"]},
-        },
-    }
-    if cookiefile:
-        ydl_opts["cookiefile"] = cookiefile
-
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.extract_info(url, download=True)
-
-    # Preferimos .mp3, senão pegamos o melhor que veio
-    for ext in ("mp3", "m4a", "webm", "opus", "mp4", "mkv"):
-        files = list(pathlib.Path(tmpdir).glob(f"*.{ext}"))
-        if files:
-            return str(files[0])
-
-    raise RuntimeError("Nenhum arquivo de áudio foi baixado.")
-
-@app.post("/download")
-def download():
-    data = request.get_json(silent=True) or {}
-    url = (data.get("url") or "").strip()
-    cookies_txt = (data.get("cookies_txt") or "")
-    if not url:
-        return jsonify(error="missing url"), 400
-    try:
-        audio_path = _download_best_audio(url, cookies_txt)
-        return send_file(
-            audio_path,
-            mimetype=_guess_mimetype(audio_path),
-            as_attachment=True,
-            download_name=os.path.basename(audio_path),
-        )
-    except Exception as e:
-        return jsonify(error=str(e)), 500
-
-@app.get("/health")
-def health():
-    return jsonify(ok=True)
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+            "Accept-Language": "pt-B
