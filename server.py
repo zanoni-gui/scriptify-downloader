@@ -35,4 +35,39 @@ def download_audio():
             cookiefile_path = tf.name
         except Exception as e:
             return jsonify({"error": f"Falha ao decodificar cookies: {str(e)}"}), 500
-    elif
+    elif cookies_env.strip():
+        tf = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
+        tf.write(cookies_env.encode("utf-8"))
+        tf.flush()
+        tf.close()
+        cookiefile_path = tf.name
+
+    # --- Opções do yt-dlp ---
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "quiet": True,
+        "noplaylist": True,
+        "outtmpl": tempfile.mktemp(suffix=".mp3"),
+        "postprocessors": [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
+        }],
+    }
+
+    if cookiefile_path:
+        ydl_opts["cookiefile"] = cookiefile_path
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+
+        audio_path = ydl_opts["outtmpl"]
+        return send_file(audio_path, mimetype="audio/mpeg")
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8000)
