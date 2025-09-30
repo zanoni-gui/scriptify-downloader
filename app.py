@@ -104,62 +104,111 @@ def _cookiefile_from_request(cookies_txt: str) -> str | None:
     return tf.name
 
 def _download_best_audio(url: str, cookies_txt: str | None) -> str:
+    """
+    Tenta baixar o melhor áudio. Primeira tentativa força cliente ANDROID (YT),
+    com m4a quando possível e chunked download para evitar 403. Se falhar,
+    faz fallback para cliente WEB. Mantém cookies (BYOC ou env).
+    """
     tmpdir = tempfile.mkdtemp()
     outtpl = os.path.join(tmpdir, "%(id)s.%(ext)s")
 
+    # Cookies: prioridade = request -> env -> nenhum
     cookiefile = _cookiefile_from_request(cookies_txt) or _cookiefile_from_env_for(url)
 
     host = (urlparse(url).netloc or "").lower()
-    referer = (
-        "https://www.youtube.com/" if "youtu" in host else
-        "https://www.instagram.com/" if "instagram" in host else
-        "https://www.tiktok.com/" if "tiktok" in host else
-        "https://www.facebook.com/"
+    referer = "https://www.youtube.com/" if "youtu" in host else (
+        "https://www.instagram.com/" if "instagram" in host else (
+            "https://www.tiktok.com/" if "tiktok" in host else "https://www.facebook.com/"
+        )
     )
 
-    # Se o ffmpeg embutido existir, coloca na frente do PATH (por via das dúvidas)
-    ff_loc = ffmpeg_location_for_ytdlp()
-    if ff_loc:
-        os.environ["PATH"] = f"{ff_loc}:{os.environ.get('PATH','')}"
+    common_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/126.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": referer,
+        "Origin": "https://www.youtube.com" if "youtu" in host else referer,
+    }
 
-    ydl_opts = {
+    def _run(ydl_opts):
+        if cookiefile:
+            ydl_opts["cookiefile"] = cookiefile
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            return ydl.extract_info(url, download=True)
+
+    # ---- 1ª tentativa: “android” + m4a + chunked (ótimo p/ YT 403) ----
+    ydl_opts_android = {
         "outtmpl": outtpl,
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "format": "bestaudio/best",
+        # prioriza m4a quando existir
+        "format": "bestaudio[ext=m4a]/bestaudio/best",
         "geo_bypass": True,
         "retries": 3,
         "socket_timeout": 25,
         "concurrent_fragment_downloads": 1,
         "force_ipv4": True,
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/126.0.0.0 Safari/537.36"
-            ),
-            "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Referer": referer,
-        },
-        # usa ffmpeg se estiver disponível
-        "prefer_ffmpeg": bool(ff_loc),
-        "ffmpeg_location": ff_loc,  # pode ser None; yt-dlp lida com isso
-        # pós-processamento: tenta mp3 se houver ffmpeg; caso contrário, deixa original (m4a/webm/opus…)
-        "postprocessors": (
-            [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "0"}]
-            if ff_loc else []
-        ),
+        # chunk de ~10MB evita throttling do YT
+        "http_chunk_size": 10 * 1024 * 1024,
+        "http_headers": {**common_headers},
+        "prefer_ffmpeg": True,
+        "ffmpeg_location": "ffmpeg",  # Render resolve via apt.txt
+        "postprocessors": [
+            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "0"}
+        ],
         "extractor_args": {
-            "youtube": {"player_client": ["web", "android", "web_embedded", "ios"]},
+            "youtube": {
+                # força cliente Android primeiro
+                "player_client": ["android"],
+                # pula configs problemáticas em alguns 403
+                "player_skip": ["configs"],
+            },
             "tiktok": {"download_api": ["Web"]},
         },
     }
-    if cookiefile:
-        ydl_opts["cookiefile"] = cookiefile
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.extract_info(url, download=True)
+    try:
+        _run(ydl_opts_android)
+    except Exception as e_android:
+        # ---- 2ª tentativa: “web” tradicional como fallback ----
+        ydl_opts_web = {
+            "outtmpl": outtpl,
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "format": "bestaudio[ext=m4a]/bestaudio/best",
+            "geo_bypass": True,
+            "retries": 3,
+            "socket_timeout": 25,
+            "concurrent_fragment_downloads": 1,
+            "force_ipv4": True,
+            "http_chunk_size": 10 * 1024 * 1024,
+            "http_headers": {
+                **common_headers,
+                "X-YouTube-Client-Name": "1",
+                "X-YouTube-Client-Version": "2.20240901.00.00",
+            },
+            "prefer_ffmpeg": True,
+            "ffmpeg_location": "ffmpeg",
+            "postprocessors": [
+                {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "0"}
+            ],
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["web", "web_embedded", "ios"],
+                },
+                "tiktok": {"download_api": ["Web"]},
+            },
+        }
+        try:
+            _run(ydl_opts_web)
+        except Exception as e_web:
+            # inclui os dois erros para debug mais fácil
+            raise RuntimeError(f"YT fallback falhou. ANDROID: {e_android} | WEB: {e_web}")
 
     # Preferimos .mp3, senão pegamos o melhor que veio
     for ext in ("mp3", "m4a", "webm", "opus", "mp4", "mkv"):
@@ -169,7 +218,6 @@ def _download_best_audio(url: str, cookies_txt: str | None) -> str:
 
     raise RuntimeError("Nenhum arquivo de áudio foi baixado.")
 
-@app.post("/download")
 def download():
     data = request.get_json(silent=True) or {}
     url = (data.get("url") or "").strip()
