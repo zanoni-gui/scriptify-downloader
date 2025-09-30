@@ -3,7 +3,7 @@ from urllib.parse import urlparse
 from flask import Flask, request, send_file, jsonify
 import yt_dlp
 
-# tenta resolver um FFmpeg local (via PATH) ou embutido (imageio-ffmpeg)
+# ---------- FFmpeg discovery ----------
 FFMPEG_BIN = shutil.which("ffmpeg")
 try:
     if not FFMPEG_BIN:
@@ -24,7 +24,22 @@ def ffmpeg_location_for_ytdlp() -> str | None:
     p = pathlib.Path(FFMPEG_BIN)
     return str(p.parent) if p.exists() else str(FFMPEG_BIN)
 
+
 app = Flask(__name__)
+
+# ---------- CORS básico ----------
+@app.after_request
+def add_cors_headers(resp):
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return resp
+
+# Home amigável (evita 404 quando abre no navegador)
+@app.get("/")
+def root():
+    return "OK - use GET /health ou POST /download", 200
+
 
 def _guess_mimetype(path: str) -> str:
     ext = pathlib.Path(path).suffix.lower()
@@ -36,6 +51,7 @@ def _guess_mimetype(path: str) -> str:
         ".opus": "audio/ogg",
         ".mkv": "video/x-matroska",
     }.get(ext, "application/octet-stream")
+
 
 # ---------- Sanitização de cookies colados (Netscape) ----------
 def _sanitize_netscape_text(cookies_txt: str) -> str:
@@ -74,7 +90,13 @@ def _sanitize_netscape_text(cookies_txt: str) -> str:
         lines.insert(2, "# This is a generated file!  Do not edit.")
     return "\n".join(lines) + "\n"
 
+
 def _cookiefile_from_env_for(url: str) -> str | None:
+    """
+    Se nada vier na requisição, tenta cookies de env (base64):
+      - YTDLP_COOKIES_B64 para YouTube
+      - IG_COOKIES_B64 para Instagram
+    """
     host = (urlparse(url).netloc or "").lower()
     var = None
     if "youtube.com" in host or "youtu.be" in host:
@@ -95,13 +117,19 @@ def _cookiefile_from_env_for(url: str) -> str | None:
     except Exception:
         return None
 
+
 def _cookiefile_from_request(cookies_txt: str) -> str | None:
+    """
+    Se o usuário colar cookies (formato Netscape) no request,
+    gravamos em arquivo temporário e retornamos o caminho.
+    """
     if not cookies_txt or not cookies_txt.strip():
         return None
     sanitized = _sanitize_netscape_text(cookies_txt)
     tf = tempfile.NamedTemporaryFile(delete=False)
     tf.write(sanitized.encode("utf-8")); tf.flush(); tf.close()
     return tf.name
+
 
 def _download_best_audio(url: str, cookies_txt: str | None) -> str:
     """
@@ -139,32 +167,28 @@ def _download_best_audio(url: str, cookies_txt: str | None) -> str:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             return ydl.extract_info(url, download=True)
 
-    # ---- 1ª tentativa: “android” + m4a + chunked (ótimo p/ YT 403) ----
+    # ---- 1ª tentativa: ANDROID + m4a + chunked (mitiga 403) ----
     ydl_opts_android = {
         "outtmpl": outtpl,
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        # prioriza m4a quando existir
         "format": "bestaudio[ext=m4a]/bestaudio/best",
         "geo_bypass": True,
         "retries": 3,
         "socket_timeout": 25,
         "concurrent_fragment_downloads": 1,
         "force_ipv4": True,
-        # chunk de ~10MB evita throttling do YT
-        "http_chunk_size": 10 * 1024 * 1024,
+        "http_chunk_size": 10 * 1024 * 1024,  # ~10MB
         "http_headers": {**common_headers},
         "prefer_ffmpeg": True,
-        "ffmpeg_location": "ffmpeg",  # Render resolve via apt.txt
+        "ffmpeg_location": ffmpeg_location_for_ytdlp() or "ffmpeg",
         "postprocessors": [
             {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "0"}
         ],
         "extractor_args": {
             "youtube": {
-                # força cliente Android primeiro
                 "player_client": ["android"],
-                # pula configs problemáticas em alguns 403
                 "player_skip": ["configs"],
             },
             "tiktok": {"download_api": ["Web"]},
@@ -174,7 +198,7 @@ def _download_best_audio(url: str, cookies_txt: str | None) -> str:
     try:
         _run(ydl_opts_android)
     except Exception as e_android:
-        # ---- 2ª tentativa: “web” tradicional como fallback ----
+        # ---- 2ª tentativa: WEB ----
         ydl_opts_web = {
             "outtmpl": outtpl,
             "quiet": True,
@@ -193,21 +217,18 @@ def _download_best_audio(url: str, cookies_txt: str | None) -> str:
                 "X-YouTube-Client-Version": "2.20240901.00.00",
             },
             "prefer_ffmpeg": True,
-            "ffmpeg_location": "ffmpeg",
+            "ffmpeg_location": ffmpeg_location_for_ytdlp() or "ffmpeg",
             "postprocessors": [
                 {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "0"}
             ],
             "extractor_args": {
-                "youtube": {
-                    "player_client": ["web", "web_embedded", "ios"],
-                },
+                "youtube": {"player_client": ["web", "web_embedded", "ios"]},
                 "tiktok": {"download_api": ["Web"]},
             },
         }
         try:
             _run(ydl_opts_web)
         except Exception as e_web:
-            # inclui os dois erros para debug mais fácil
             raise RuntimeError(f"YT fallback falhou. ANDROID: {e_android} | WEB: {e_web}")
 
     # Preferimos .mp3, senão pegamos o melhor que veio
@@ -218,10 +239,28 @@ def _download_best_audio(url: str, cookies_txt: str | None) -> str:
 
     raise RuntimeError("Nenhum arquivo de áudio foi baixado.")
 
+
+# ---------- Rotas ----------
+@app.route("/download", methods=["POST", "GET", "OPTIONS"])
 def download():
-    data = request.get_json(silent=True) or {}
-    url = (data.get("url") or "").strip()
-    cookies_txt = (data.get("cookies_txt") or "")
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    if request.method == "GET":
+        # /download?url=...&cookies_b64=... (opcional)
+        url = (request.args.get("url") or "").strip()
+        cookies_b64 = request.args.get("cookies_b64") or ""
+        cookies_txt = ""
+        if cookies_b64:
+            try:
+                cookies_txt = base64.b64decode(cookies_b64).decode("utf-8", "ignore")
+            except Exception:
+                cookies_txt = ""
+    else:
+        data = request.get_json(silent=True) or {}
+        url = (data.get("url") or "").strip()
+        cookies_txt = (data.get("cookies_txt") or "")
+
     if not url:
         return jsonify(error="missing url"), 400
     try:
@@ -235,9 +274,11 @@ def download():
     except Exception as e:
         return jsonify(error=str(e)), 500
 
+
 @app.get("/health")
 def health():
     return jsonify(ok=True)
+
 
 @app.get("/debug")
 def debug():
@@ -245,8 +286,9 @@ def debug():
         ffmpeg_found=bool(FFMPEG_BIN),
         ffmpeg_bin=FFMPEG_BIN,
         ffmpeg_location=ffmpeg_location_for_ytdlp(),
-        path=os.environ.get("PATH","")[:500],
+        path=os.environ.get("PATH", "")[:500],
     )
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
