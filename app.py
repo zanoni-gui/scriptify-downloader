@@ -2,7 +2,7 @@ import os, tempfile, pathlib, base64, re, shutil, json
 from urllib.parse import urlparse
 from flask import Flask, request, send_file, jsonify
 import yt_dlp
-import requests  # <- para buscar cookies no Supabase
+import requests  # Supabase REST
 
 # ---------- FFmpeg discovery ----------
 FFMPEG_BIN = shutil.which("ffmpeg")
@@ -18,7 +18,6 @@ def ffmpeg_location_for_ytdlp() -> str | None:
         return None
     p = pathlib.Path(FFMPEG_BIN)
     return str(p.parent) if p.exists() else str(FFMPEG_BIN)
-
 
 app = Flask(__name__)
 
@@ -39,14 +38,46 @@ def _domain_key_for(url: str) -> str:
 
 def _get_latest_cookies_from_supabase(domain_key: str) -> str | None:
     """
-    Espera uma tabela 'cookies' com:
-      - domain TEXT
-      - cookies_txt TEXT
-      - updated_at TIMESTAMPTZ (DEFAULT now())
-    RLS: libere SELECT anônimo nessa tabela ou crie uma view pública.
+    Aceita os dois esquemas de tabela:
+
+      Esquema novo (o seu):
+        - tabela: cookies
+        - colunas: host (TEXT), cookie_text (TEXT), updated_at (TIMESTAMPTZ)
+
+      Esquema antigo (fallback):
+        - tabela: cookies
+        - colunas: domain (TEXT), cookies_txt (TEXT), updated_at (TIMESTAMPTZ)
+
+    IMPORTANTE: Habilite uma policy de SELECT anônima (USING true).
     """
     if not _supabase_can_use():
         return None
+
+    headers = {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+    }
+
+    # 1) Tenta seu esquema (host + cookie_text)
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/cookies"
+        params = {
+            "select": "cookie_text,updated_at",
+            "host": f"eq.{domain_key}",
+            "order": "updated_at.desc",
+            "limit": 1,
+        }
+        r = requests.get(url, headers=headers, params=params, timeout=15)
+        if r.status_code == 200:
+            rows = r.json()
+            if rows:
+                txt = rows[0].get("cookie_text")
+                if txt:
+                    return txt
+    except Exception:
+        pass
+
+    # 2) Fallback: schema antigo (domain + cookies_txt)
     try:
         url = f"{SUPABASE_URL}/rest/v1/cookies"
         params = {
@@ -55,21 +86,17 @@ def _get_latest_cookies_from_supabase(domain_key: str) -> str | None:
             "order": "updated_at.desc",
             "limit": 1,
         }
-        headers = {
-            "apikey": SUPABASE_ANON_KEY,
-            "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
-            "Content-Type": "application/json",
-        }
         r = requests.get(url, headers=headers, params=params, timeout=15)
         if r.status_code == 200:
             rows = r.json()
             if rows:
-                return rows[0].get("cookies_txt") or None
-        # qualquer outro status: ignora silenciosamente
+                txt = rows[0].get("cookies_txt")
+                if txt:
+                    return txt
     except Exception:
         pass
-    return None
 
+    return None
 
 # ---------- CORS básico ----------
 @app.after_request
@@ -83,7 +110,6 @@ def add_cors_headers(resp):
 def root():
     return "OK - use GET /health ou POST /download", 200
 
-
 def _guess_mimetype(path: str) -> str:
     ext = pathlib.Path(path).suffix.lower()
     return {
@@ -94,7 +120,6 @@ def _guess_mimetype(path: str) -> str:
         ".opus": "audio/ogg",
         ".mkv": "video/x-matroska",
     }.get(ext, "application/octet-stream")
-
 
 # ---------- Sanitização de cookies colados (Netscape) ----------
 def _sanitize_netscape_text(cookies_txt: str) -> str:
@@ -125,14 +150,13 @@ def _sanitize_netscape_text(cookies_txt: str) -> str:
         lines.insert(2, "# This is a generated file!  Do not edit.")
     return "\n".join(lines) + "\n"
 
-
 def _cookiefile_from_env_for(url: str) -> str | None:
     """
     Se nada vier na requisição, tenta cookies de env (base64):
-      - YTDLP_COOKIES_B64 p/ YouTube
-      - IG_COOKIES_B64    p/ Instagram
-      - TK_COOKIES_B64    p/ TikTok (opcional)
-      - FB_COOKIES_B64    p/ Facebook (opcional)
+      - YTDLP_COOKIES_B64 (YouTube)
+      - IG_COOKIES_B64    (Instagram)
+      - TK_COOKIES_B64    (TikTok)
+      - FB_COOKIES_B64    (Facebook)
     """
     host = (urlparse(url).netloc or "").lower()
     var = None
@@ -158,7 +182,6 @@ def _cookiefile_from_env_for(url: str) -> str | None:
     except Exception:
         return None
 
-
 def _cookiefile_from_request(cookies_txt: str) -> str | None:
     if not cookies_txt or not cookies_txt.strip():
         return None
@@ -167,11 +190,7 @@ def _cookiefile_from_request(cookies_txt: str) -> str | None:
     tf.write(sanitized.encode("utf-8")); tf.flush(); tf.close()
     return tf.name
 
-
 def _cookiefile_from_supabase(url: str) -> str | None:
-    """
-    Busca o último cookies_txt no Supabase (se configurado) e grava em tmp.
-    """
     domain_key = _domain_key_for(url)
     txt = _get_latest_cookies_from_supabase(domain_key)
     if not txt:
@@ -181,25 +200,40 @@ def _cookiefile_from_supabase(url: str) -> str | None:
     tf.write(sanitized.encode("utf-8")); tf.flush(); tf.close()
     return tf.name
 
+# Para debug em /debug
+LAST_COOKIE_SOURCE = "none"
+
+def _choose_cookiefile(url: str, cookies_txt: str | None) -> str | None:
+    """Define a prioridade: request > env > supabase, registrando a fonte."""
+    global LAST_COOKIE_SOURCE
+    cf = _cookiefile_from_request(cookies_txt)
+    if cf:
+        LAST_COOKIE_SOURCE = "request"
+        return cf
+    cf = _cookiefile_from_env_for(url)
+    if cf:
+        LAST_COOKIE_SOURCE = "env"
+        return cf
+    cf = _cookiefile_from_supabase(url)
+    if cf:
+        LAST_COOKIE_SOURCE = "supabase"
+        return cf
+    LAST_COOKIE_SOURCE = "none"
+    return None
 
 # ---------- Download: SEM reencode (mantém trilha original) ----------
 def _download_best_audio(url: str, cookies_txt: str | None) -> str:
     """
     Baixa a melhor trilha de ÁUDIO possível SEM reencodar.
-    - Priorizamos formatos originais (m4a/webm/opus) p/ máxima fidelidade.
-    - Cookies por domínio (prioridade): request > env > supabase.
+    - Priorizamos formatos originais (m4a/webm/opus).
+    - Cookies por domínio: request > env > supabase.
     - 1ª tentativa: client ANDROID (YT) com chunk; 2ª: WEB.
-    - Sem FFmpegExtractAudio (que reencoda).
+    - Sem FFmpegExtractAudio (evita conversão).
     """
     tmpdir = tempfile.mkdtemp()
     outtpl = os.path.join(tmpdir, "%(id)s.%(ext)s")
 
-    # cookies: request -> env -> supabase
-    cookiefile = (
-        _cookiefile_from_request(cookies_txt)
-        or _cookiefile_from_env_for(url)
-        or _cookiefile_from_supabase(url)
-    )
+    cookiefile = _choose_cookiefile(url, cookies_txt)
 
     host = (urlparse(url).netloc or "").lower()
     referer = (
@@ -209,7 +243,6 @@ def _download_best_audio(url: str, cookies_txt: str | None) -> str:
         "https://www.facebook.com/"
     )
 
-    # Cabeçalhos “realistas”
     common_headers = {
         "User-Agent": (
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -227,7 +260,6 @@ def _download_best_audio(url: str, cookies_txt: str | None) -> str:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             return ydl.extract_info(url, download=True)
 
-    # Formatos por domínio (sem reencodar)
     yt_fmt = "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio/webm/bestaudio/best"
     ig_fmt = "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio/best"
     tk_fmt = "bestaudio[ext=m4a]/bestaudio/best"
@@ -240,7 +272,7 @@ def _download_best_audio(url: str, cookies_txt: str | None) -> str:
         fb_fmt
     )
 
-    # ===== 1ª tentativa: ANDROID (YT) com chunks (mitiga 403) =====
+    # 1ª tentativa: ANDROID (YT) com chunks
     ydl_opts_android = {
         "outtmpl": outtpl,
         "quiet": True,
@@ -252,7 +284,7 @@ def _download_best_audio(url: str, cookies_txt: str | None) -> str:
         "socket_timeout": 30,
         "concurrent_fragment_downloads": 1,
         "force_ipv4": True,
-        "http_chunk_size": 10 * 1024 * 1024,  # ~10MB
+        "http_chunk_size": 10 * 1024 * 1024,
         "http_headers": {**common_headers},
         "prefer_ffmpeg": True,
         "ffmpeg_location": ffmpeg_location_for_ytdlp() or "ffmpeg",
@@ -271,7 +303,7 @@ def _download_best_audio(url: str, cookies_txt: str | None) -> str:
     try:
         _run(ydl_opts_android)
     except Exception as e_android:
-        # ===== 2ª tentativa: WEB =====
+        # 2ª tentativa: WEB
         ydl_opts_web = {
             "outtmpl": outtpl,
             "quiet": True,
@@ -302,23 +334,21 @@ def _download_best_audio(url: str, cookies_txt: str | None) -> str:
         try:
             _run(ydl_opts_web)
         except Exception as e_web:
-            # mensagens mais úteis por domínio
             host_lower = host.lower()
             hint = ""
             if "instagram" in host_lower:
-                hint = " • Instagram geralmente exige cookies válidos. Cole cookies em formato Netscape ou configure IG_COOKIES_B64/Supabase."
+                hint = " • Instagram geralmente exige cookies válidos. Cole cookies (Netscape) ou configure IG_COOKIES_B64/Supabase."
             elif "youtube" in host_lower or "youtu.be" in host_lower:
-                hint = " • YouTube pode exigir cookies. Use cookies (Netscape) ou configure YTDLP_COOKIES_B64/Supabase."
+                hint = " • YouTube pode exigir cookies. Configure YTDLP_COOKIES_B64 ou salve no Supabase (host=youtube.com)."
             raise RuntimeError(f"Download falhou. ANDROID: {e_android} | WEB: {e_web}{hint}")
 
-    # Preferência (sem conversão)
+    # Escolhe o que baixar (sem conversão)
     for ext in ("m4a", "webm", "opus", "mp3", "mp4", "mkv"):
         files = list(pathlib.Path(tmpdir).glob(f"*.{ext}"))
         if files:
             return str(files[0])
 
     raise RuntimeError("Nenhum arquivo de áudio foi baixado.")
-
 
 # ---------- Rotas ----------
 @app.route("/download", methods=["POST", "GET", "OPTIONS"])
@@ -353,11 +383,9 @@ def download():
     except Exception as e:
         return jsonify(error=str(e)), 500
 
-
 @app.get("/health")
 def health():
     return jsonify(ok=True)
-
 
 @app.get("/debug")
 def debug():
@@ -368,9 +396,9 @@ def debug():
         supabase_enabled=_supabase_can_use(),
         env_yt=bool(os.getenv("YTDLP_COOKIES_B64")),
         env_ig=bool(os.getenv("IG_COOKIES_B64")),
+        last_cookie_source=LAST_COOKIE_SOURCE,
         path=os.environ.get("PATH", "")[:500],
     )
-
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
