@@ -8,17 +8,11 @@ FFMPEG_BIN = shutil.which("ffmpeg")
 try:
     if not FFMPEG_BIN:
         import imageio_ffmpeg
-        FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()  # caminho completo do binário
+        FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()
 except Exception:
-    FFMPEG_BIN = shutil.which("ffmpeg")  # última tentativa
+    FFMPEG_BIN = shutil.which("ffmpeg")
 
 def ffmpeg_location_for_ytdlp() -> str | None:
-    """
-    yt-dlp aceita:
-      - caminho da pasta contendo ffmpeg/ffprobe
-      - OU caminho do executável
-    Vamos devolver a pasta se possível, senão o executável.
-    """
     if not FFMPEG_BIN:
         return None
     p = pathlib.Path(FFMPEG_BIN)
@@ -35,7 +29,6 @@ def add_cors_headers(resp):
     resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     return resp
 
-# Home amigável (evita 404 quando abre no navegador)
 @app.get("/")
 def root():
     return "OK - use GET /health ou POST /download", 200
@@ -55,13 +48,6 @@ def _guess_mimetype(path: str) -> str:
 
 # ---------- Sanitização de cookies colados (Netscape) ----------
 def _sanitize_netscape_text(cookies_txt: str) -> str:
-    """
-    Normaliza um texto possivelmente colado do navegador:
-    - remove BOM e normaliza quebras de linha
-    - garante cabeçalho Netscape
-    - reconstrói linhas sem TAB (7 colunas) separando por espaços
-    - remove linhas vazias em excesso
-    """
     if not cookies_txt:
         return ""
     txt = cookies_txt.encode("utf-8", "ignore").decode("utf-8", "ignore")
@@ -77,7 +63,6 @@ def _sanitize_netscape_text(cookies_txt: str) -> str:
                 seen_header = True
             lines.append(line)
             continue
-        # Se a linha não tem TAB, tenta reconstruir: 7 colunas
         if "\t" not in line:
             parts = re.split(r"\s+", line, maxsplit=6)
             if len(parts) >= 7:
@@ -94,8 +79,8 @@ def _sanitize_netscape_text(cookies_txt: str) -> str:
 def _cookiefile_from_env_for(url: str) -> str | None:
     """
     Se nada vier na requisição, tenta cookies de env (base64):
-      - YTDLP_COOKIES_B64 para YouTube
-      - IG_COOKIES_B64 para Instagram
+      - YTDLP_COOKIES_B64 p/ YouTube
+      - IG_COOKIES_B64    p/ Instagram
     """
     host = (urlparse(url).netloc or "").lower()
     var = None
@@ -119,10 +104,6 @@ def _cookiefile_from_env_for(url: str) -> str | None:
 
 
 def _cookiefile_from_request(cookies_txt: str) -> str | None:
-    """
-    Se o usuário colar cookies (formato Netscape) no request,
-    gravamos em arquivo temporário e retornamos o caminho.
-    """
     if not cookies_txt or not cookies_txt.strip():
         return None
     sanitized = _sanitize_netscape_text(cookies_txt)
@@ -131,25 +112,29 @@ def _cookiefile_from_request(cookies_txt: str) -> str | None:
     return tf.name
 
 
+# ---------- Download: SEM reencode (mantém trilha original) ----------
 def _download_best_audio(url: str, cookies_txt: str | None) -> str:
     """
-    Tenta baixar o melhor áudio. Primeira tentativa força cliente ANDROID (YT),
-    com m4a quando possível e chunked download para evitar 403. Se falhar,
-    faz fallback para cliente WEB. Mantém cookies (BYOC ou env).
+    Baixa a melhor trilha de ÁUDIO possível SEM reencodar.
+    - Priorizamos formatos originais (m4a/webm/opus) p/ máxima fidelidade.
+    - Cookies por domínio (request > env).
+    - 1ª tentativa: client ANDROID (YT) com chunk; 2ª: WEB.
+    - Sem FFmpegExtractAudio (que costuma reencodar p/ mp3).
     """
     tmpdir = tempfile.mkdtemp()
     outtpl = os.path.join(tmpdir, "%(id)s.%(ext)s")
 
-    # Cookies: prioridade = request -> env -> nenhum
     cookiefile = _cookiefile_from_request(cookies_txt) or _cookiefile_from_env_for(url)
 
     host = (urlparse(url).netloc or "").lower()
-    referer = "https://www.youtube.com/" if "youtu" in host else (
-        "https://www.instagram.com/" if "instagram" in host else (
-            "https://www.tiktok.com/" if "tiktok" in host else "https://www.facebook.com/"
-        )
+    referer = (
+        "https://www.youtube.com/" if "youtu" in host else
+        "https://www.instagram.com/" if "instagram" in host else
+        "https://www.tiktok.com/" if "tiktok" in host else
+        "https://www.facebook.com/"
     )
 
+    # Cabeçalhos “realistas”
     common_headers = {
         "User-Agent": (
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -167,47 +152,65 @@ def _download_best_audio(url: str, cookies_txt: str | None) -> str:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             return ydl.extract_info(url, download=True)
 
-    # ---- 1ª tentativa: ANDROID + m4a + chunked (mitiga 403) ----
+    # Formatos por domínio (sem reencodar):
+    # - YouTube: m4a (AAC) costuma vir "limpo"; senão webm/opus.
+    # - Instagram: frequentemente mp4/m4a.
+    # - TikTok: m4a/webm (varia).
+    yt_fmt = "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio/webm/bestaudio/best"
+    ig_fmt = "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio/best"
+    tk_fmt = "bestaudio[ext=m4a]/bestaudio/best"
+    fb_fmt = "bestaudio[ext=m4a]/bestaudio/best"
+
+    pick_fmt = (
+        yt_fmt if ("youtu" in host) else
+        ig_fmt if ("instagram" in host) else
+        tk_fmt if ("tiktok" in host) else
+        fb_fmt
+    )
+
+    # ===== 1ª tentativa: ANDROID (YT) com chunks (mitiga 403) =====
     ydl_opts_android = {
         "outtmpl": outtpl,
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "format": "bestaudio[ext=m4a]/bestaudio/best",
+        "format": pick_fmt,
         "geo_bypass": True,
-        "retries": 3,
-        "socket_timeout": 25,
+        "retries": 10,
+        "socket_timeout": 30,
         "concurrent_fragment_downloads": 1,
         "force_ipv4": True,
         "http_chunk_size": 10 * 1024 * 1024,  # ~10MB
         "http_headers": {**common_headers},
         "prefer_ffmpeg": True,
         "ffmpeg_location": ffmpeg_location_for_ytdlp() or "ffmpeg",
-        "postprocessors": [
-            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "0"}
-        ],
         "extractor_args": {
             "youtube": {
                 "player_client": ["android"],
                 "player_skip": ["configs"],
             },
             "tiktok": {"download_api": ["Web"]},
+            # Instagram tende a exigir cookies válidos; sem “magia” aqui
         },
+        # IMPORTANTE: sem postprocessors (evita reencode/conversão)
+        "postprocessors": [],
+        "allow_unplayable_formats": False,
+        "noprogress": True,
     }
 
     try:
         _run(ydl_opts_android)
     except Exception as e_android:
-        # ---- 2ª tentativa: WEB ----
+        # ===== 2ª tentativa: WEB =====
         ydl_opts_web = {
             "outtmpl": outtpl,
             "quiet": True,
             "no_warnings": True,
             "noplaylist": True,
-            "format": "bestaudio[ext=m4a]/bestaudio/best",
+            "format": pick_fmt,
             "geo_bypass": True,
-            "retries": 3,
-            "socket_timeout": 25,
+            "retries": 10,
+            "socket_timeout": 30,
             "concurrent_fragment_downloads": 1,
             "force_ipv4": True,
             "http_chunk_size": 10 * 1024 * 1024,
@@ -218,21 +221,21 @@ def _download_best_audio(url: str, cookies_txt: str | None) -> str:
             },
             "prefer_ffmpeg": True,
             "ffmpeg_location": ffmpeg_location_for_ytdlp() or "ffmpeg",
-            "postprocessors": [
-                {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "0"}
-            ],
             "extractor_args": {
                 "youtube": {"player_client": ["web", "web_embedded", "ios"]},
                 "tiktok": {"download_api": ["Web"]},
             },
+            "postprocessors": [],
+            "allow_unplayable_formats": False,
+            "noprogress": True,
         }
         try:
             _run(ydl_opts_web)
         except Exception as e_web:
             raise RuntimeError(f"YT fallback falhou. ANDROID: {e_android} | WEB: {e_web}")
 
-    # Preferimos .mp3, senão pegamos o melhor que veio
-    for ext in ("mp3", "m4a", "webm", "opus", "mp4", "mkv"):
+    # Pegamos o melhor que veio (sem converter). Ordem de preferência:
+    for ext in ("m4a", "webm", "opus", "mp3", "mp4", "mkv"):
         files = list(pathlib.Path(tmpdir).glob(f"*.{ext}"))
         if files:
             return str(files[0])
@@ -247,7 +250,6 @@ def download():
         return ("", 204)
 
     if request.method == "GET":
-        # /download?url=...&cookies_b64=... (opcional)
         url = (request.args.get("url") or "").strip()
         cookies_b64 = request.args.get("cookies_b64") or ""
         cookies_txt = ""
