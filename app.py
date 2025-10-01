@@ -33,9 +33,9 @@ def add_cors_headers(resp):
 
 @app.get("/")
 def root():
-    return "OK - use GET /health, GET /debug, POST /download", 200
+    return "OK - use GET /health, GET /debug, GET /ytdlp/version, POST /download", 200
 
-# ===================== Supabase (read-only + upsert) =====================
+# ===================== Supabase (read + upsert) =====================
 SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").rstrip("/")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY") or ""
 
@@ -55,7 +55,7 @@ def _get_latest_cookies_from_supabase(domain_key: str) -> str | None:
     Suporta 2 esquemas de tabela:
       - (novo)  host TEXT, cookie_text TEXT, updated_at TIMESTAMPTZ
       - (legado) domain TEXT, cookies_txt TEXT, updated_at TIMESTAMPTZ
-    É necessário liberar RLS de SELECT (USING true) ou criar view pública.
+    Necessário permitir SELECT via RLS (USING true) no MVP.
     """
     if not _supabase_can_use():
         return None
@@ -103,9 +103,8 @@ def _get_latest_cookies_from_supabase(domain_key: str) -> str | None:
 
 def _supabase_upsert_cookie(domain: str, cookies_txt: str) -> dict:
     """
-    Salva cookies no Supabase. Tenta primeiro (host, cookie_text) e depois
-    (domain, cookies_txt). Requer policy INSERT/UPSERT liberada para o anon
-    OU criação de uma Edge Function própria (não necessário no MVP).
+    Salva cookies no Supabase. Tenta (host,cookie_text) e depois (domain,cookies_txt).
+    Requer RLS liberada para INSERT/UPDATE no MVP.
     """
     if not _supabase_can_use():
         return {"ok": False, "schema": None, "status": 400, "text": "SUPABASE not configured"}
@@ -118,18 +117,17 @@ def _supabase_upsert_cookie(domain: str, cookies_txt: str) -> dict:
         "Prefer": "resolution=merge-duplicates",
     }
 
-    # 1) esquema novo
+    # 1) novo
     try:
         payload_new = {"host": domain, "cookie_text": cookies_txt}
         r = requests.post(url, headers=headers, json=payload_new, timeout=15)
         if r.status_code in (200, 201, 204):
             return {"ok": True, "schema": "new", "status": r.status_code, "text": ""}
+        last_err = r.text
     except Exception as e:
         last_err = str(e)
-    else:
-        last_err = r.text if hasattr(r, "text") else str(r)
 
-    # 2) fallback legado
+    # 2) legado
     try:
         payload_old = {"domain": domain, "cookies_txt": cookies_txt}
         r2 = requests.post(url, headers=headers, json=payload_old, timeout=15)
@@ -212,19 +210,30 @@ def _cookiefile_from_supabase(url: str) -> str | None:
 
 LAST_COOKIE_SOURCE = "none"  # registrado para /debug
 
-def _choose_cookiefile(url: str, cookies_txt: str | None) -> str | None:
-    """Prioridade: request > env > supabase (e registra a fonte)."""
+def _choose_cookiefile(url: str, cookies_txt: str | None, prefer: str = "auto") -> str | None:
+    """
+    prefer: 'auto' | 'request' | 'env' | 'supabase'
+    """
     global LAST_COOKIE_SOURCE
-    cf = _cookiefile_from_request(cookies_txt)
-    if cf:
-        LAST_COOKIE_SOURCE = "request"; return cf
-    cf = _cookiefile_from_env_for(url)
-    if cf:
-        LAST_COOKIE_SOURCE = "env"; return cf
-    cf = _cookiefile_from_supabase(url)
-    if cf:
-        LAST_COOKIE_SOURCE = "supabase"; return cf
-    LAST_COOKIE_SOURCE = "none"; return None
+    sources = {
+        "request": [_cookiefile_from_request, _cookiefile_from_env_for, _cookiefile_from_supabase],
+        "env":     [_cookiefile_from_env_for, _cookiefile_from_request, _cookiefile_from_supabase],
+        "supabase":[_cookiefile_from_supabase, _cookiefile_from_request, _cookiefile_from_env_for],
+        "auto":    [_cookiefile_from_request, _cookiefile_from_env_for, _cookiefile_from_supabase],
+    }.get(prefer or "auto", None)
+
+    if not sources:
+        sources = [_cookiefile_from_request, _cookiefile_from_env_for, _cookiefile_from_supabase]
+
+    for fn in sources:
+        cf = fn(url) if fn in (_cookiefile_from_env_for, _cookiefile_from_supabase) else fn(cookies_txt)  # type: ignore[arg-type]
+        if cf:
+            if fn is _cookiefile_from_request: LAST_COOKIE_SOURCE = "request"
+            elif fn is _cookiefile_from_env_for: LAST_COOKIE_SOURCE = "env"
+            else: LAST_COOKIE_SOURCE = "supabase"
+            return cf
+    LAST_COOKIE_SOURCE = "none"
+    return None
 
 # ===================== Download (yt-dlp) =====================
 def _guess_mimetype(path: str) -> str:
@@ -238,7 +247,7 @@ def _guess_mimetype(path: str) -> str:
         ".mkv": "video/x-matroska",
     }.get(ext, "application/octet-stream")
 
-def _download_best_audio(url: str, cookies_txt: str | None) -> str:
+def _download_best_audio(url: str, cookies_txt: str | None, prefer_cookie_source: str = "auto") -> str:
     """
     Baixa a melhor trilha de ÁUDIO possível SEM reencodar.
     - Prioriza m4a/webm/opus
@@ -246,7 +255,7 @@ def _download_best_audio(url: str, cookies_txt: str | None) -> str:
     """
     tmpdir = tempfile.mkdtemp()
     outtpl = os.path.join(tmpdir, "%(id)s.%(ext)s")
-    cookiefile = _choose_cookiefile(url, cookies_txt)
+    cookiefile = _choose_cookiefile(url, cookies_txt, prefer_cookie_source)
 
     host = (urlparse(url).netloc or "").lower()
     referer = (
@@ -278,7 +287,7 @@ def _download_best_audio(url: str, cookies_txt: str | None) -> str:
 
     pick_fmt = yt_fmt if ("youtu" in host) else ig_fmt if ("instagram" in host) else tk_fmt if ("tiktok" in host) else fb_fmt
 
-    # 1) ANDROID (mitiga captcha/403 no YT)
+    # 1) ANDROID
     ydl_opts_android = {
         "outtmpl": outtpl,
         "quiet": True, "no_warnings": True, "noplaylist": True,
@@ -344,6 +353,13 @@ def download():
     if request.method == "OPTIONS":
         return ("", 204)
 
+    prefer_cookie_source = (
+        (request.args.get("cookies_source") if request.method == "GET" else (request.get_json(silent=True) or {}).get("cookies_source"))
+        or "auto"
+    )
+    if prefer_cookie_source not in ("auto", "request", "env", "supabase"):
+        prefer_cookie_source = "auto"
+
     if request.method == "GET":
         url = (request.args.get("url") or "").strip()
         cookies_b64 = request.args.get("cookies_b64") or ""
@@ -361,7 +377,7 @@ def download():
     if not url:
         return jsonify(error="missing url"), 400
     try:
-        audio_path = _download_best_audio(url, cookies_txt)
+        audio_path = _download_best_audio(url, cookies_txt, prefer_cookie_source)
         return send_file(
             audio_path,
             mimetype=_guess_mimetype(audio_path),
@@ -374,6 +390,10 @@ def download():
 @app.get("/health")
 def health():
     return jsonify(ok=True)
+
+@app.get("/ytdlp/version")
+def ytdlp_version():
+    return jsonify(version=getattr(yt_dlp, "__version__", "unknown"))
 
 @app.get("/debug")
 def debug():
@@ -392,11 +412,10 @@ def debug():
 @app.route("/cookies/push", methods=["POST", "OPTIONS"])
 def cookies_push():
     """
-    Salva cookies no Supabase (para 'youtube.com', 'instagram.com', etc).
     Body JSON:
-      { "domain": "youtube.com", "cookies_txt": "<arquivo Netscape>" }
+      { "domain": "youtube.com", "cookies_txt": "<Netscape>" }
     ou
-      { "host": "youtube.com", "cookie_text": "<arquivo Netscape>" }
+      { "host": "youtube.com", "cookie_text": "<Netscape>" }
     """
     if request.method == "OPTIONS":
         return ("", 204)
