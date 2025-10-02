@@ -88,7 +88,6 @@ def _supabase_upsert_cookie(domain: str, cookies_txt: str) -> dict:
     if not _supabase_can_use():
         return {"ok": False, "schema": None, "status": 400, "text": "SUPABASE not configured"}
 
-    # on_conflict=host garante upsert; Prefer merge-duplicates mantém a semântica
     url = f"{SUPABASE_URL}/rest/v1/cookies?on_conflict=host"
     headers = {
         "apikey": SUPABASE_ANON_KEY,
@@ -298,53 +297,84 @@ def _download_best_audio(url: str, cookies_txt: str | None, prefer_cookie_source
     pick_fmt = yt_fmt if ("youtu" in host) else ig_fmt if ("instagram" in host) else tk_fmt if ("tiktok" in host) else fb_fmt
 
     # 1) ANDROID
+    ydl_opts_android = {
+        "outtmpl": outtpl,
+        "quiet": True, "no_warnings": True, "noplaylist": True,
+        "format": pick_fmt, "geo_bypass": True,
+        "retries": 6, "socket_timeout": 30,
+        "concurrent_fragment_downloads": 1, "force_ipv4": True,
+        "http_chunk_size": 10 * 1024 * 1024,
+        "http_headers": {**common_headers},
+        "prefer_ffmpeg": True,
+        "ffmpeg_location": ffmpeg_location_for_ytdlp() or "ffmpeg",
+        "extractor_args": {
+            "youtube": {"player_client": ["android"], "player_skip": ["configs"]},
+            "tiktok": {"download_api": ["Web"]},
+        },
+        "postprocessors": [],
+        "allow_unplayable_formats": False,
+        "noprogress": True,
+    }
+
+    # 2) iOS (novo fallback)
+    ydl_opts_ios = {
+        "outtmpl": outtpl,
+        "quiet": True, "no_warnings": True, "noplaylist": True,
+        "format": pick_fmt, "geo_bypass": True,
+        "retries": 6, "socket_timeout": 30,
+        "concurrent_fragment_downloads": 1, "force_ipv4": True,
+        "http_chunk_size": 10 * 1024 * 1024,
+        "http_headers": {**common_headers},
+        "prefer_ffmpeg": True,
+        "ffmpeg_location": ffmpeg_location_for_ytdlp() or "ffmpeg",
+        "extractor_args": {
+            "youtube": {"player_client": ["ios"], "player_skip": ["configs"]},
+            "tiktok": {"download_api": ["Web"]},
+        },
+        "postprocessors": [],
+        "allow_unplayable_formats": False,
+        "noprogress": True,
+    }
+
+    # 3) WEB (fallback final)
+    ydl_opts_web = {
+        "outtmpl": outtpl,
+        "quiet": True, "no_warnings": True, "noplaylist": True,
+        "format": pick_fmt, "geo_bypass": True,
+        "retries": 6, "socket_timeout": 30,
+        "concurrent_fragment_downloads": 1, "force_ipv4": True,
+        "http_chunk_size": 10 * 1024 * 1024,
+        "http_headers": {**common_headers,
+                         "X-YouTube-Client-Name": "1",
+                         "X-YouTube-Client-Version": "2.20240901.00.00"},
+        "prefer_ffmpeg": True,
+        "ffmpeg_location": ffmpeg_location_for_ytdlp() or "ffmpeg",
+        "extractor_args": {
+            "youtube": {"player_client": ["web", "web_embedded"]},
+            "tiktok": {"download_api": ["Web"]},
+        },
+        "postprocessors": [],
+        "allow_unplayable_formats": False,
+        "noprogress": True,
+    }
+
     try:
-        _run({
-            "outtmpl": outtpl,
-            "quiet": True, "no_warnings": True, "noplaylist": True,
-            "format": pick_fmt, "geo_bypass": True,
-            "retries": 6, "socket_timeout": 30,
-            "concurrent_fragment_downloads": 1, "force_ipv4": True,
-            "http_chunk_size": 10 * 1024 * 1024,
-            "http_headers": {**common_headers},
-            "prefer_ffmpeg": True,
-            "ffmpeg_location": ffmpeg_location_for_ytdlp() or "ffmpeg",
-            "extractor_args": {
-                "youtube": {"player_client": ["android"], "player_skip": ["configs"]},
-                "tiktok": {"download_api": ["Web"]},
-            },
-            "postprocessors": [],
-            "allow_unplayable_formats": False,
-            "noprogress": True,
-        })
+        _run(ydl_opts_android)
     except Exception as e_android:
-        # 2) WEB
         try:
-            _run({
-                "outtmpl": outtpl,
-                "quiet": True, "no_warnings": True, "noplaylist": True,
-                "format": pick_fmt, "geo_bypass": True,
-                "retries": 6, "socket_timeout": 30,
-                "concurrent_fragment_downloads": 1, "force_ipv4": True,
-                "http_chunk_size": 10 * 1024 * 1024,
-                "http_headers": {**common_headers,
-                                 "X-YouTube-Client-Name": "1",
-                                 "X-YouTube-Client-Version": "2.20240901.00.00"},
-                "prefer_ffmpeg": True,
-                "ffmpeg_location": ffmpeg_location_for_ytdlp() or "ffmpeg",
-                "extractor_args": {"youtube": {"player_client": ["web", "web_embedded", "ios"]},
-                                   "tiktok": {"download_api": ["Web"]}},
-                "postprocessors": [],
-                "allow_unplayable_formats": False,
-                "noprogress": True,
-            })
-        except Exception as e_web:
-            hint = ""
-            if "instagram" in host:
-                hint = " • Instagram geralmente exige cookies válidos."
-            if "youtu" in host:
-                hint = " • YouTube pode exigir cookies (YTDLP_COOKIES_B64 ou Supabase host=youtube.com)."
-            raise RuntimeError(f"Download falhou. ANDROID: {e_android} | WEB: {e_web}{hint}")
+            _run(ydl_opts_ios)
+        except Exception as e_ios:
+            try:
+                _run(ydl_opts_web)
+            except Exception as e_web:
+                hint = ""
+                if "instagram" in host:
+                    hint = " • Instagram geralmente exige cookies válidos (IG)."
+                if "youtu" in host:
+                    hint = " • YouTube pode exigir cookies fortes (SID/HSID/SSID/SAPISID/etc)."
+                raise RuntimeError(
+                    f"Download falhou. ANDROID: {e_android} | iOS: {e_ios} | WEB: {e_web}{hint}"
+                )
 
     # escolhe arquivo sem reencodar
     for ext in ("m4a", "webm", "opus", "mp3", "mp4", "mkv"):
