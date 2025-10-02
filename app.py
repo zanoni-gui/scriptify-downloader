@@ -172,6 +172,9 @@ def _cookiefile_from_supabase(url: str) -> str | None:
 LAST_COOKIE_SOURCE = "none"
 
 def _choose_cookiefile(url: str, cookies_txt: str | None, prefer: str = "auto") -> str | None:
+    """
+    prefer: 'auto' | 'request' | 'env' | 'supabase'
+    """
     global LAST_COOKIE_SOURCE
     sources = {
         "request": [_cookiefile_from_request, _cookiefile_from_env_for, _cookiefile_from_supabase],
@@ -192,6 +195,21 @@ def _choose_cookiefile(url: str, cookies_txt: str | None, prefer: str = "auto") 
             return cf
     LAST_COOKIE_SOURCE = "none"
     return None
+
+# --- Adiciona CONSENT automaticamente em cookiefile do YouTube, se faltar ---
+def _ensure_youtube_consent(cookiefile: str | None) -> str | None:
+    if not cookiefile:
+        return None
+    try:
+        txt = pathlib.Path(cookiefile).read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return cookiefile
+    if re.search(r"^\s*[.]youtube[.]com\s+\S+\s+/\s+\S+\s+0\s+CONSENT\s+", txt, flags=re.M):
+        return cookiefile
+    patched = txt.rstrip("\n") + "\n.youtube.com\tTRUE\t/\tFALSE\t0\tCONSENT\tYES+cb.20210328-17-p0.en+FX+123\n"
+    tf = tempfile.NamedTemporaryFile(delete=False)
+    tf.write(patched.encode("utf-8")); tf.flush(); tf.close()
+    return tf.name
 
 # ===================== URL helpers (YouTube) =====================
 def _normalize_youtube_url(u: str) -> str:
@@ -249,12 +267,18 @@ def _guess_mimetype(path: str) -> str:
 def _download_best_audio(url: str, cookies_txt: str | None, prefer_cookie_source: str = "auto") -> str:
     tmpdir = tempfile.mkdtemp()
     outtpl = os.path.join(tmpdir, "%(id)s.%(ext)s")
+
+    # Normaliza URL e escolhe cookiefile
+    url = _normalize_youtube_url(url)
     cookiefile = _choose_cookiefile(url, cookies_txt, prefer_cookie_source)
 
-    url = _normalize_youtube_url(url)
     host = (urlparse(url).netloc or "").lower()
+    if "youtu" in host:
+        cookiefile = _ensure_youtube_consent(cookiefile)
 
     # UAs/headers por cliente
+    UA_MWEB = ("Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) "
+               "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1")
     UA_IOS = "com.google.ios.youtube/19.09.3 (iPhone; U; CPU iOS 16_6 like Mac OS X; en_US)"
     UA_WEB = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
               "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
@@ -287,7 +311,7 @@ def _download_best_audio(url: str, cookies_txt: str | None, prefer_cookie_source
     fb_fmt = "bestaudio[ext=m4a]/bestaudio/best"
     pick_fmt = yt_fmt if ("youtu" in host) else ig_fmt if ("instagram" in host) else tk_fmt if ("tiktok" in host) else fb_fmt
 
-    # ===== Tentativa 1: iOS =====
+    # ===== Tentativa 1: mweb (evita embedded 153) =====
     try:
         _run({
             "outtmpl": outtpl,
@@ -297,20 +321,20 @@ def _download_best_audio(url: str, cookies_txt: str | None, prefer_cookie_source
             "concurrent_fragment_downloads": 1, "force_ipv4": True,
             "http_chunk_size": 10 * 1024 * 1024,
             "http_headers": {
-                **common_headers(UA_IOS, referer),
-                "X-YouTube-Client-Name": "5",          # iOS
-                "X-YouTube-Client-Version": "19.09.3",
+                **common_headers(UA_MWEB, referer),
+                "X-YouTube-Client-Name": "2",          # mweb
+                "X-YouTube-Client-Version": "2.20240901.00.00",
             },
             "prefer_ffmpeg": True,
             "ffmpeg_location": ffmpeg_location_for_ytdlp() or "ffmpeg",
-            "extractor_args": {"youtube": {"player_client": ["ios"], "player_skip": ["configs"]},
+            "extractor_args": {"youtube": {"player_client": ["mweb"], "player_skip": ["configs"]},
                                "tiktok": {"download_api": ["Web"]}},
             "postprocessors": [],
             "allow_unplayable_formats": False,
             "noprogress": True,
         })
-    except Exception as e_ios:
-        # ===== Tentativa 2: Web/Embedded =====
+    except Exception as e_mweb:
+        # ===== Tentativa 2: iOS =====
         try:
             _run({
                 "outtmpl": outtpl,
@@ -320,20 +344,20 @@ def _download_best_audio(url: str, cookies_txt: str | None, prefer_cookie_source
                 "concurrent_fragment_downloads": 1, "force_ipv4": True,
                 "http_chunk_size": 10 * 1024 * 1024,
                 "http_headers": {
-                    **common_headers(UA_WEB, referer),
-                    "X-YouTube-Client-Name": "1",       # Web
-                    "X-YouTube-Client-Version": "2.20240901.00.00",
+                    **common_headers(UA_IOS, referer),
+                    "X-YouTube-Client-Name": "5",      # iOS
+                    "X-YouTube-Client-Version": "19.09.3",
                 },
                 "prefer_ffmpeg": True,
                 "ffmpeg_location": ffmpeg_location_for_ytdlp() or "ffmpeg",
-                "extractor_args": {"youtube": {"player_client": ["web_embedded", "web"]},
+                "extractor_args": {"youtube": {"player_client": ["ios"], "player_skip": ["configs"]},
                                    "tiktok": {"download_api": ["Web"]}},
                 "postprocessors": [],
                 "allow_unplayable_formats": False,
                 "noprogress": True,
             })
-        except Exception as e_web:
-            # ===== Tentativa 3: Android =====
+        except Exception as e_ios:
+            # ===== Tentativa 3: Web (sem embedded) =====
             try:
                 _run({
                     "outtmpl": outtpl,
@@ -343,28 +367,52 @@ def _download_best_audio(url: str, cookies_txt: str | None, prefer_cookie_source
                     "concurrent_fragment_downloads": 1, "force_ipv4": True,
                     "http_chunk_size": 10 * 1024 * 1024,
                     "http_headers": {
-                        **common_headers(UA_ANDROID, referer),
-                        "X-YouTube-Client-Name": "3",   # Android
-                        "X-YouTube-Client-Version": "19.09.39",
+                        **common_headers(UA_WEB, referer),
+                        "X-YouTube-Client-Name": "1",   # web
+                        "X-YouTube-Client-Version": "2.20240901.00.00",
                     },
                     "prefer_ffmpeg": True,
                     "ffmpeg_location": ffmpeg_location_for_ytdlp() or "ffmpeg",
-                    "extractor_args": {"youtube": {"player_client": ["android"], "player_skip": ["configs"]},
+                    "extractor_args": {"youtube": {"player_client": ["web"]},
                                        "tiktok": {"download_api": ["Web"]}},
                     "postprocessors": [],
                     "allow_unplayable_formats": False,
                     "noprogress": True,
                 })
-            except Exception as e_android:
-                hint = ""
-                if "instagram" in host:
-                    hint = " • Instagram geralmente exige cookies válidos."
-                if "youtu" in host:
-                    hint = " • YouTube pode exigir cookies (YTDLP_COOKIES_B64 ou Supabase host=youtube.com)."
-                raise RuntimeError(
-                    f"Download falhou. iOS: {e_ios} | WEB: {e_web} | ANDROID: {e_android}{hint}"
-                )
+            except Exception as e_web:
+                # ===== Tentativa 4: Android =====
+                try:
+                    _run({
+                        "outtmpl": outtpl,
+                        "quiet": True, "no_warnings": True, "noplaylist": True,
+                        "format": pick_fmt, "geo_bypass": True,
+                        "retries": 6, "socket_timeout": 30,
+                        "concurrent_fragment_downloads": 1, "force_ipv4": True,
+                        "http_chunk_size": 10 * 1024 * 1024,
+                        "http_headers": {
+                            **common_headers(UA_ANDROID, referer),
+                            "X-YouTube-Client-Name": "3", # android
+                            "X-YouTube-Client-Version": "19.09.39",
+                        },
+                        "prefer_ffmpeg": True,
+                        "ffmpeg_location": ffmpeg_location_for_ytdlp() or "ffmpeg",
+                        "extractor_args": {"youtube": {"player_client": ["android"], "player_skip": ["configs"]},
+                                           "tiktok": {"download_api": ["Web"]}},
+                        "postprocessors": [],
+                        "allow_unplayable_formats": False,
+                        "noprogress": True,
+                    })
+                except Exception as e_android:
+                    hint = ""
+                    if "instagram" in host:
+                        hint = " • Instagram geralmente exige cookies válidos."
+                    if "youtu" in host:
+                        hint = " • YouTube pode exigir cookies (YTDLP_COOKIES_B64 ou Supabase host=youtube.com)."
+                    raise RuntimeError(
+                        f"Download falhou. MWEB: {e_mweb} | iOS: {e_ios} | WEB: {e_web} | ANDROID: {e_android}{hint}"
+                    )
 
+    # escolhe arquivo sem reencodar
     for ext in ("m4a", "webm", "opus", "mp3", "mp4", "mkv"):
         files = list(pathlib.Path(tmpdir).glob(f"*.{ext}"))
         if files:
