@@ -1,5 +1,4 @@
-# app.py
-import os, tempfile, pathlib, base64, re, shutil
+import os, tempfile, pathlib, base64, re, shutil, json
 from urllib.parse import urlparse
 from flask import Flask, request, send_file, jsonify
 import yt_dlp
@@ -51,12 +50,6 @@ def _domain_key_for(url: str) -> str:
     return host or "unknown"
 
 def _get_latest_cookies_from_supabase(domain_key: str) -> str | None:
-    """
-    Suporta 2 esquemas:
-      - (novo)  host TEXT, cookie_text TEXT, updated_at TIMESTAMPTZ
-      - (legado) domain TEXT, cookies_txt TEXT, updated_at TIMESTAMPTZ
-    Necessário permitir SELECT via RLS (USING true) no MVP.
-    """
     if not _supabase_can_use():
         return None
 
@@ -65,7 +58,7 @@ def _get_latest_cookies_from_supabase(domain_key: str) -> str | None:
         "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
     }
 
-    # 1) esquema novo
+    # esquema atual
     try:
         url = f"{SUPABASE_URL}/rest/v1/cookies"
         params = {
@@ -82,27 +75,14 @@ def _get_latest_cookies_from_supabase(domain_key: str) -> str | None:
     except Exception:
         pass
 
-    # 2) esquema legado
-    try:
-        url = f"{SUPABASE_URL}/rest/v1/cookies"
-        params = {
-            "select": "cookies_txt,updated_at",
-            "domain": f"eq.{domain_key}",
-            "order": "updated_at.desc",
-            "limit": 1,
-        }
-        r = requests.get(url, headers=headers, params=params, timeout=15)
-        if r.status_code == 200:
-            rows = r.json()
-            if rows and rows[0].get("cookies_txt"):
-                return rows[0]["cookies_txt"]
-    except Exception:
-        pass
-
     return None
 
 def _supabase_upsert_cookie(domain: str, cookies_txt: str) -> dict:
-    """Upsert no Supabase: tenta (host,cookie_text) e depois (domain,cookies_txt)."""
+    """
+    Salva cookies no Supabase usando APENAS o esquema atual:
+      - tabela: cookies
+      - colunas: host, cookie_text
+    """
     if not _supabase_can_use():
         return {"ok": False, "schema": None, "status": 400, "text": "SUPABASE not configured"}
 
@@ -114,25 +94,14 @@ def _supabase_upsert_cookie(domain: str, cookies_txt: str) -> dict:
         "Prefer": "resolution=merge-duplicates",
     }
 
-    # 1) novo
+    payload = {"host": domain, "cookie_text": cookies_txt}
     try:
-        payload_new = {"host": domain, "cookie_text": cookies_txt}
-        r = requests.post(url, headers=headers, json=payload_new, timeout=15)
+        r = requests.post(url, headers=headers, json=payload, timeout=15)
         if r.status_code in (200, 201, 204):
             return {"ok": True, "schema": "new", "status": r.status_code, "text": ""}
-        last_err = r.text
+        return {"ok": False, "schema": "new", "status": r.status_code, "text": r.text}
     except Exception as e:
-        last_err = str(e)
-
-    # 2) legado
-    try:
-        payload_old = {"domain": domain, "cookies_txt": cookies_txt}
-        r2 = requests.post(url, headers=headers, json=payload_old, timeout=15)
-        if r2.status_code in (200, 201, 204):
-            return {"ok": True, "schema": "old", "status": r2.status_code, "text": ""}
-        return {"ok": False, "schema": None, "status": r2.status_code, "text": r2.text}
-    except Exception as e2:
-        return {"ok": False, "schema": None, "status": 500, "text": f"{last_err} | {e2}"}
+        return {"ok": False, "schema": "new", "status": 500, "text": str(e)}
 
 # ===================== Helpers: cookies =====================
 def _sanitize_netscape_text(cookies_txt: str) -> str:
@@ -208,9 +177,6 @@ def _cookiefile_from_supabase(url: str) -> str | None:
 LAST_COOKIE_SOURCE = "none"
 
 def _choose_cookiefile(url: str, cookies_txt: str | None, prefer: str = "auto") -> str | None:
-    """
-    prefer: 'auto' | 'request' | 'env' | 'supabase'
-    """
     global LAST_COOKIE_SOURCE
     sources = {
         "request": [_cookiefile_from_request, _cookiefile_from_env_for, _cookiefile_from_supabase],
@@ -245,11 +211,6 @@ def _guess_mimetype(path: str) -> str:
     }.get(ext, "application/octet-stream")
 
 def _download_best_audio(url: str, cookies_txt: str | None, prefer_cookie_source: str = "auto") -> str:
-    """
-    Baixa a melhor trilha de ÁUDIO possível SEM reencodar.
-    - Prioriza m4a/webm/opus
-    - Fallback YT: ANDROID -> WEB
-    """
     tmpdir = tempfile.mkdtemp()
     outtpl = os.path.join(tmpdir, "%(id)s.%(ext)s")
     cookiefile = _choose_cookiefile(url, cookies_txt, prefer_cookie_source)
@@ -284,59 +245,53 @@ def _download_best_audio(url: str, cookies_txt: str | None, prefer_cookie_source
 
     pick_fmt = yt_fmt if ("youtu" in host) else ig_fmt if ("instagram" in host) else tk_fmt if ("tiktok" in host) else fb_fmt
 
-    # 1) ANDROID
-    ydl_opts_android = {
-        "outtmpl": outtpl,
-        "quiet": True, "no_warnings": True, "noplaylist": True,
-        "format": pick_fmt, "geo_bypass": True,
-        "retries": 6, "socket_timeout": 30,
-        "concurrent_fragment_downloads": 1, "force_ipv4": True,
-        "http_chunk_size": 10 * 1024 * 1024,
-        "http_headers": {**common_headers},
-        "prefer_ffmpeg": True,
-        "ffmpeg_location": ffmpeg_location_for_ytdlp() or "ffmpeg",
-        "extractor_args": {
-            "youtube": {"player_client": ["android"], "player_skip": ["configs"]},
-            "tiktok": {"download_api": ["Web"]},
-        },
-        "postprocessors": [],
-        "allow_unplayable_formats": False,
-        "noprogress": True,
-    }
-
     try:
-        _run(ydl_opts_android)
-    except Exception as e_android:
-        # 2) WEB
-        ydl_opts_web = {
+        _run({
             "outtmpl": outtpl,
             "quiet": True, "no_warnings": True, "noplaylist": True,
             "format": pick_fmt, "geo_bypass": True,
             "retries": 6, "socket_timeout": 30,
             "concurrent_fragment_downloads": 1, "force_ipv4": True,
             "http_chunk_size": 10 * 1024 * 1024,
-            "http_headers": {**common_headers,
-                             "X-YouTube-Client-Name": "1",
-                             "X-YouTube-Client-Version": "2.20240901.00.00"},
+            "http_headers": {**common_headers},
             "prefer_ffmpeg": True,
             "ffmpeg_location": ffmpeg_location_for_ytdlp() or "ffmpeg",
-            "extractor_args": {"youtube": {"player_client": ["web", "web_embedded", "ios"]},
-                               "tiktok": {"download_api": ["Web"]}},
+            "extractor_args": {
+                "youtube": {"player_client": ["android"], "player_skip": ["configs"]},
+                "tiktok": {"download_api": ["Web"]},
+            },
             "postprocessors": [],
             "allow_unplayable_formats": False,
             "noprogress": True,
-        }
+        })
+    except Exception as e_android:
         try:
-            _run(ydl_opts_web)
+            _run({
+                "outtmpl": outtpl,
+                "quiet": True, "no_warnings": True, "noplaylist": True,
+                "format": pick_fmt, "geo_bypass": True,
+                "retries": 6, "socket_timeout": 30,
+                "concurrent_fragment_downloads": 1, "force_ipv4": True,
+                "http_chunk_size": 10 * 1024 * 1024,
+                "http_headers": {**common_headers,
+                                 "X-YouTube-Client-Name": "1",
+                                 "X-YouTube-Client-Version": "2.20240901.00.00"},
+                "prefer_ffmpeg": True,
+                "ffmpeg_location": ffmpeg_location_for_ytdlp() or "ffmpeg",
+                "extractor_args": {"youtube": {"player_client": ["web", "web_embedded", "ios"]},
+                                   "tiktok": {"download_api": ["Web"]}},
+                "postprocessors": [],
+                "allow_unplayable_formats": False,
+                "noprogress": True,
+            })
         except Exception as e_web:
             hint = ""
             if "instagram" in host:
-                hint = " • Instagram geralmente exige cookies válidos (IG_COOKIES_B64 ou Supabase)."
-            if "youtu" in host or "youtube" in host:
+                hint = " • Instagram geralmente exige cookies válidos."
+            if "youtu" in host:
                 hint = " • YouTube pode exigir cookies (YTDLP_COOKIES_B64 ou Supabase host=youtube.com)."
             raise RuntimeError(f"Download falhou. ANDROID: {e_android} | WEB: {e_web}{hint}")
 
-    # escolhe arquivo sem reencodar
     for ext in ("m4a", "webm", "opus", "mp3", "mp4", "mkv"):
         files = list(pathlib.Path(tmpdir).glob(f"*.{ext}"))
         if files:
@@ -413,12 +368,6 @@ def debug():
 # ===================== Rotas: Cookies (MVP) =====================
 @app.route("/cookies/push", methods=["POST", "OPTIONS"])
 def cookies_push():
-    """
-    Body JSON:
-      { "domain": "youtube.com", "cookies_txt": "<Netscape>" }
-    ou
-      { "host": "youtube.com", "cookie_text": "<Netscape>" }
-    """
     if request.method == "OPTIONS":
         return ("", 204)
 
@@ -436,10 +385,6 @@ def cookies_push():
 
 @app.route("/cookies/fetch", methods=["GET"])
 def cookies_fetch():
-    """
-    GET /cookies/fetch?domain=youtube.com
-    Retorna {ok, domain, cookies_txt}
-    """
     domain = (request.args.get("domain") or request.args.get("host") or "").strip().lower()
     if not domain:
         return jsonify(ok=False, error="missing domain"), 400
