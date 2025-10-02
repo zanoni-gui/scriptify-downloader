@@ -130,7 +130,29 @@ def _sanitize_netscape_text(cookies_txt: str) -> str:
         lines.insert(2, "# This is a generated file!  Do not edit.")
     return "\n".join(lines) + "\n"
 
+# --- Base64 leniente p/ cookies em env (aceita urlsafe e falta de padding) ---
+ENV_YT_ERROR: str | None = None
+
+def _b64_decode_any(s: str) -> bytes:
+    """
+    Tenta decodificar Base64 normal e urlsafe, removendo quebras de linha e corrigindo padding.
+    """
+    t = "".join((s or "").split())
+    if not t:
+        raise ValueError("empty base64")
+    errs = []
+    for alt in (None, b"-_"):
+        try:
+            pad = "=" * (-len(t) % 4)
+            return base64.b64decode(t + pad, altchars=alt, validate=False)
+        except Exception as e:
+            errs.append(f"{'urlsafe' if alt else 'std'}: {e}")
+    raise ValueError(" / ".join(errs))
+
 def _cookiefile_from_env_for(url: str) -> str | None:
+    global ENV_YT_ERROR
+    ENV_YT_ERROR = None
+
     host = (urlparse(url).netloc or "").lower()
     var = None
     if "youtube.com" in host or "youtu.be" in host:
@@ -144,15 +166,21 @@ def _cookiefile_from_env_for(url: str) -> str | None:
 
     if not var:
         return None
-    b64 = (os.getenv(var) or "").strip()
-    if not b64:
+    b64 = (os.getenv(var) or "")
+    if not b64.strip():
+        ENV_YT_ERROR = f"{var} not set or empty"
         return None
     try:
-        raw = base64.b64decode(b64)
+        raw = _b64_decode_any(b64)
+    except Exception as e:
+        ENV_YT_ERROR = f"{var} decode failed: {e}"
+        return None
+    try:
         tf = tempfile.NamedTemporaryFile(delete=False)
         tf.write(raw); tf.flush(); tf.close()
         return tf.name
-    except Exception:
+    except Exception as e:
+        ENV_YT_ERROR = f"{var} write tmp failed: {e}"
         return None
 
 def _cookiefile_from_request(cookies_txt: str) -> str | None:
@@ -226,7 +254,6 @@ def _build_cookie_header(cookie_path: str, host: str) -> str | None:
         mp = _read_cookies_map(cookie_path)
         if not mp:
             return None
-        # prioriza cookies fortes primeiro
         order = [
             "SID", "__Secure-1PSID", "__Secure-3PSID",
             "HSID", "SSID", "APISID", "SAPISID",
@@ -240,7 +267,6 @@ def _build_cookie_header(cookie_path: str, host: str) -> str | None:
             if k in mp and k not in seen:
                 pieces.append(f"{k}={mp[k]}")
                 seen.add(k)
-        # inclui o restante
         for k, v in mp.items():
             if k not in seen:
                 pieces.append(f"{k}={v}")
@@ -271,11 +297,42 @@ def _build_sapisidhash_headers(origin: str, cookie_path: str) -> tuple[dict[str,
 def _choose_cookiefile(url: str, cookies_txt: str | None, prefer: str = "auto") -> str | None:
     """
     prefer: 'auto' | 'request' | 'env' | 'supabase'
+    Regras:
+      - 'env' é estrito: tenta só env (sem fallback). Se falhar, retorna None.
+      - demais: mantém a ordem de fallback.
     """
     global LAST_COOKIE_SOURCE, LAST_COOKIE_SNAPSHOT
+
+    if prefer == "env":
+        cf = _cookiefile_from_env_for(url)
+        if cf:
+            LAST_COOKIE_SOURCE = "env"
+        else:
+            LAST_COOKIE_SOURCE = "none"
+        LAST_COOKIE_SNAPSHOT = []
+        host = (urlparse(url).netloc or "").lower()
+        if cf and ("youtube.com" in host or "youtu.be" in host):
+            try:
+                cf = _ensure_consent_cookie(cf)
+            except Exception:
+                pass
+        if cf:
+            try:
+                lines = []
+                with open(cf, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        if line.startswith("#") or not line.strip():
+                            continue
+                        lines.append(line.strip())
+                        if len(lines) >= 20:
+                            break
+                LAST_COOKIE_SNAPSHOT = lines
+            except Exception:
+                LAST_COOKIE_SNAPSHOT = []
+        return cf
+
     sources = {
         "request": [_cookiefile_from_request, _cookiefile_from_env_for, _cookiefile_from_supabase],
-        "env":     [_cookiefile_from_env_for, _cookiefile_from_request, _cookiefile_from_supabase],
         "supabase":[_cookiefile_from_supabase, _cookiefile_from_request, _cookiefile_from_env_for],
         "auto":    [_cookiefile_from_request, _cookiefile_from_env_for, _cookiefile_from_supabase],
     }.get(prefer or "auto", None)
@@ -292,18 +349,19 @@ def _choose_cookiefile(url: str, cookies_txt: str | None, prefer: str = "auto") 
             else: LAST_COOKIE_SOURCE = "supabase"
             cf_path = cf
             break
+
     if not cf_path:
         LAST_COOKIE_SOURCE = "none"
         LAST_COOKIE_SNAPSHOT = []
         return None
 
-    # Se YouTube, injeta CONSENT se faltar e guarda snapshot
     host = (urlparse(url).netloc or "").lower()
     if "youtube.com" in host or "youtu.be" in host:
         try:
             cf_path = _ensure_consent_cookie(cf_path)
         except Exception:
             pass
+
     try:
         lines = []
         with open(cf_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -430,10 +488,8 @@ def _download_best_audio(url: str, cookies_txt: str | None, prefer_cookie_source
 
     def _mk_headers(ua):
         hdrs = {**base_headers(ua), **extra_auth_headers}
-        # Não fixar X-YouTube-Client-Version para não conflitar com versões do yt-dlp
         if cookie_header and ("youtube" in host or "youtu.be" in host):
             hdrs["Cookie"] = cookie_header
-        # Alguns cabeçalhos comuns de Chrome ajudam a parecer real
         hdrs.update({
             "sec-fetch-site": "same-origin",
             "sec-fetch-mode": "navigate",
@@ -588,6 +644,7 @@ def debug():
         supabase_enabled=_supabase_can_use(),
         env_yt=bool(os.getenv("YTDLP_COOKIES_B64")),
         env_ig=bool(os.getenv("IG_COOKIES_B64")),
+        env_yt_error=ENV_YT_ERROR,
         last_cookie_source=LAST_COOKIE_SOURCE,
         cookie_snapshot=LAST_COOKIE_SNAPSHOT[:20],
         auth_snapshot=AUTH_SNAPSHOT,
