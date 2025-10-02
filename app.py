@@ -53,12 +53,10 @@ def _domain_key_for(url: str) -> str:
 def _get_latest_cookies_from_supabase(domain_key: str) -> str | None:
     if not _supabase_can_use():
         return None
-
     headers = {
         "apikey": SUPABASE_ANON_KEY,
         "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
     }
-
     try:
         url = f"{SUPABASE_URL}/rest/v1/cookies"
         params = {
@@ -74,7 +72,6 @@ def _get_latest_cookies_from_supabase(domain_key: str) -> str | None:
                 return rows[0]["cookie_text"]
     except Exception:
         pass
-
     return None
 
 def _supabase_upsert_cookie(domain: str, cookies_txt: str) -> dict:
@@ -130,29 +127,7 @@ def _sanitize_netscape_text(cookies_txt: str) -> str:
         lines.insert(2, "# This is a generated file!  Do not edit.")
     return "\n".join(lines) + "\n"
 
-# --- Base64 leniente p/ cookies em env (aceita urlsafe e falta de padding) ---
-ENV_YT_ERROR: str | None = None
-
-def _b64_decode_any(s: str) -> bytes:
-    """
-    Tenta decodificar Base64 normal e urlsafe, removendo quebras de linha e corrigindo padding.
-    """
-    t = "".join((s or "").split())
-    if not t:
-        raise ValueError("empty base64")
-    errs = []
-    for alt in (None, b"-_"):
-        try:
-            pad = "=" * (-len(t) % 4)
-            return base64.b64decode(t + pad, altchars=alt, validate=False)
-        except Exception as e:
-            errs.append(f"{'urlsafe' if alt else 'std'}: {e}")
-    raise ValueError(" / ".join(errs))
-
 def _cookiefile_from_env_for(url: str) -> str | None:
-    global ENV_YT_ERROR
-    ENV_YT_ERROR = None
-
     host = (urlparse(url).netloc or "").lower()
     var = None
     if "youtube.com" in host or "youtu.be" in host:
@@ -166,21 +141,15 @@ def _cookiefile_from_env_for(url: str) -> str | None:
 
     if not var:
         return None
-    b64 = (os.getenv(var) or "")
-    if not b64.strip():
-        ENV_YT_ERROR = f"{var} not set or empty"
+    b64 = (os.getenv(var) or "").strip()
+    if not b64:
         return None
     try:
-        raw = _b64_decode_any(b64)
-    except Exception as e:
-        ENV_YT_ERROR = f"{var} decode failed: {e}"
-        return None
-    try:
+        raw = base64.b64decode(b64)
         tf = tempfile.NamedTemporaryFile(delete=False)
         tf.write(raw); tf.flush(); tf.close()
         return tf.name
-    except Exception as e:
-        ENV_YT_ERROR = f"{var} write tmp failed: {e}"
+    except Exception:
         return None
 
 def _cookiefile_from_request(cookies_txt: str) -> str | None:
@@ -206,7 +175,6 @@ LAST_COOKIE_SNAPSHOT: list[str] = []   # primeiras linhas do cookie realmente ca
 AUTH_SNAPSHOT: dict[str, str] = {}     # headers de auth gerados (p/ debug)
 AUTH_USING: str | None = None          # qual cookie baseou o SAPISIDHASH
 SUCCESS_CLIENT: str | None = None      # rótulo do client que funcionou
-COOKIE_HEADER_SAMPLE: str | None = None  # primeiros caracteres do header Cookie aplicado
 
 def _ensure_consent_cookie(cookie_path: str) -> str:
     """
@@ -245,36 +213,6 @@ def _read_cookies_map(cookie_path: str) -> dict[str, str]:
         return {}
     return mp
 
-def _build_cookie_header(cookie_path: str, host: str) -> str | None:
-    """
-    Constrói um header 'Cookie' simples a partir do arquivo Netscape.
-    Usamos nomes mais relevantes p/ YouTube em prioridade.
-    """
-    try:
-        mp = _read_cookies_map(cookie_path)
-        if not mp:
-            return None
-        order = [
-            "SID", "__Secure-1PSID", "__Secure-3PSID",
-            "HSID", "SSID", "APISID", "SAPISID",
-            "__Secure-1PAPISID", "__Secure-3PAPISID",
-            "LOGIN_INFO", "PREF", "VISITOR_INFO1_LIVE", "VISITOR_PRIVACY_METADATA",
-            "YSC", "CONSENT", "__Secure-ROLLOUT_TOKEN",
-        ]
-        pieces = []
-        seen = set()
-        for k in order:
-            if k in mp and k not in seen:
-                pieces.append(f"{k}={mp[k]}")
-                seen.add(k)
-        for k, v in mp.items():
-            if k not in seen:
-                pieces.append(f"{k}={v}")
-                seen.add(k)
-        return "; ".join(pieces)
-    except Exception:
-        return None
-
 def _build_sapisidhash_headers(origin: str, cookie_path: str) -> tuple[dict[str, str], str | None]:
     """
     Monta headers Authorization SAPISIDHASH a partir de SAPISID / __Secure-3PAPISID / __Secure-1PAPISID.
@@ -297,42 +235,11 @@ def _build_sapisidhash_headers(origin: str, cookie_path: str) -> tuple[dict[str,
 def _choose_cookiefile(url: str, cookies_txt: str | None, prefer: str = "auto") -> str | None:
     """
     prefer: 'auto' | 'request' | 'env' | 'supabase'
-    Regras:
-      - 'env' é estrito: tenta só env (sem fallback). Se falhar, retorna None.
-      - demais: mantém a ordem de fallback.
     """
     global LAST_COOKIE_SOURCE, LAST_COOKIE_SNAPSHOT
-
-    if prefer == "env":
-        cf = _cookiefile_from_env_for(url)
-        if cf:
-            LAST_COOKIE_SOURCE = "env"
-        else:
-            LAST_COOKIE_SOURCE = "none"
-        LAST_COOKIE_SNAPSHOT = []
-        host = (urlparse(url).netloc or "").lower()
-        if cf and ("youtube.com" in host or "youtu.be" in host):
-            try:
-                cf = _ensure_consent_cookie(cf)
-            except Exception:
-                pass
-        if cf:
-            try:
-                lines = []
-                with open(cf, "r", encoding="utf-8", errors="ignore") as f:
-                    for line in f:
-                        if line.startswith("#") or not line.strip():
-                            continue
-                        lines.append(line.strip())
-                        if len(lines) >= 20:
-                            break
-                LAST_COOKIE_SNAPSHOT = lines
-            except Exception:
-                LAST_COOKIE_SNAPSHOT = []
-        return cf
-
     sources = {
         "request": [_cookiefile_from_request, _cookiefile_from_env_for, _cookiefile_from_supabase],
+        "env":     [_cookiefile_from_env_for, _cookiefile_from_request, _cookiefile_from_supabase],
         "supabase":[_cookiefile_from_supabase, _cookiefile_from_request, _cookiefile_from_env_for],
         "auto":    [_cookiefile_from_request, _cookiefile_from_env_for, _cookiefile_from_supabase],
     }.get(prefer or "auto", None)
@@ -349,19 +256,18 @@ def _choose_cookiefile(url: str, cookies_txt: str | None, prefer: str = "auto") 
             else: LAST_COOKIE_SOURCE = "supabase"
             cf_path = cf
             break
-
     if not cf_path:
         LAST_COOKIE_SOURCE = "none"
         LAST_COOKIE_SNAPSHOT = []
         return None
 
+    # Se YouTube, injeta CONSENT se faltar e guarda snapshot
     host = (urlparse(url).netloc or "").lower()
     if "youtube.com" in host or "youtu.be" in host:
         try:
             cf_path = _ensure_consent_cookie(cf_path)
         except Exception:
             pass
-
     try:
         lines = []
         with open(cf_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -436,7 +342,7 @@ def _download_best_audio(url: str, cookies_txt: str | None, prefer_cookie_source
     tmpdir = tempfile.mkdtemp()
     outtpl = os.path.join(tmpdir, "%(id)s.%(ext)s")
 
-    # Normaliza YouTube (Shorts -> watch, flags has_verified/bpctr)
+    # Normaliza YouTube
     url = _normalize_youtube_url(url)
 
     cookiefile = _choose_cookiefile(url, cookies_txt, prefer_cookie_source)
@@ -465,31 +371,39 @@ def _download_best_audio(url: str, cookies_txt: str | None, prefer_cookie_source
             "Origin": "https://www.youtube.com" if "youtu" in host else referer,
         }
 
-    # Headers de autenticação + Cookie se possível
-    global AUTH_SNAPSHOT, AUTH_USING, SUCCESS_CLIENT, COOKIE_HEADER_SAMPLE
+    # Auth (SAPISIDHASH) se possível
+    global AUTH_SNAPSHOT, AUTH_USING, SUCCESS_CLIENT
     AUTH_SNAPSHOT, AUTH_USING = {}, None
-    SUCCESS_CLIENT, COOKIE_HEADER_SAMPLE = None, None
+    SUCCESS_CLIENT = None
 
     extra_auth_headers: dict[str, str] = {}
-    cookie_header = None
     if cookiefile and ("youtube" in host or "youtu.be" in host):
         try:
             extra_auth_headers, AUTH_USING = _build_sapisidhash_headers("https://www.youtube.com", cookiefile)
             AUTH_SNAPSHOT = dict(extra_auth_headers)
         except Exception:
             AUTH_SNAPSHOT, AUTH_USING = {}, None
-        try:
-            cookie_header = _build_cookie_header(cookiefile, host)
-            if cookie_header:
-                COOKIE_HEADER_SAMPLE = cookie_header[:220]
-        except Exception:
-            cookie_header = None
-            COOKIE_HEADER_SAMPLE = None
 
-    def _mk_headers(ua):
+    # Cabeçalhos por client (sem header Cookie manual!)
+    def headers_for(client: str, ua: str):
         hdrs = {**base_headers(ua), **extra_auth_headers}
-        if cookie_header and ("youtube" in host or "youtu.be" in host):
-            hdrs["Cookie"] = cookie_header
+        # X-YouTube-Client-Name/Version coerentes com client
+        if client == "web":
+            hdrs["X-YouTube-Client-Name"] = "1"
+            hdrs["X-YouTube-Client-Version"] = "2.20241001.00.00"
+        elif client == "mweb":
+            hdrs["X-YouTube-Client-Name"] = "2"
+            hdrs["X-YouTube-Client-Version"] = "2.20241001.00.00"
+        elif client == "android":
+            hdrs["X-YouTube-Client-Name"] = "3"
+            hdrs["X-YouTube-Client-Version"] = "19.33.37"
+        elif client == "ios":
+            hdrs["X-YouTube-Client-Name"] = "5"
+            hdrs["X-YouTube-Client-Version"] = "19.09.3"
+        elif client in ("tv", "tv_embedded", "web_embedded"):
+            hdrs["X-YouTube-Client-Name"] = "1"
+            hdrs["X-YouTube-Client-Version"] = "2.20241001.00.00"
+        # alguns headers de navegação comuns
         hdrs.update({
             "sec-fetch-site": "same-origin",
             "sec-fetch-mode": "navigate",
@@ -511,34 +425,34 @@ def _download_best_audio(url: str, cookies_txt: str | None, prefer_cookie_source
     fb_fmt = "bestaudio[ext=m4a]/bestaudio/best"
     pick_fmt = yt_fmt if ("youtu" in host) else ig_fmt if ("instagram" in host) else tk_fmt if ("tiktok" in host) else fb_fmt
 
-    # Tentativas com diferentes clients (sem forçar Client-Version)
+    # Tentativas com diferentes clients
     attempts = [
-        ("mweb", dict(
-            http_headers=_mk_headers(UA_MOBILE),
-            extractor_args={"youtube": {"player_client": ["mweb"], "player_skip": ["configs"]}},
-        )),
         ("web", dict(
-            http_headers=_mk_headers(UA_DESKTOP),
+            http_headers=headers_for("web", UA_DESKTOP),
             extractor_args={"youtube": {"player_client": ["web"], "player_skip": ["configs"]}},
         )),
+        ("mweb", dict(
+            http_headers=headers_for("mweb", UA_MOBILE),
+            extractor_args={"youtube": {"player_client": ["mweb"], "player_skip": ["configs"]}},
+        )),
         ("web_embedded", dict(
-            http_headers=_mk_headers(UA_DESKTOP),
+            http_headers=headers_for("web_embedded", UA_DESKTOP),
             extractor_args={"youtube": {"player_client": ["web_embedded"], "player_skip": ["configs"]}},
         )),
         ("android", dict(
-            http_headers=_mk_headers(UA_MOBILE),
+            http_headers=headers_for("android", UA_MOBILE),
             extractor_args={"youtube": {"player_client": ["android"], "player_skip": ["configs"]}},
         )),
         ("ios", dict(
-            http_headers=_mk_headers(UA_MOBILE),
+            http_headers=headers_for("ios", UA_MOBILE),
             extractor_args={"youtube": {"player_client": ["ios"], "player_skip": ["configs"]}},
         )),
         ("tv", dict(
-            http_headers=_mk_headers(UA_DESKTOP),
+            http_headers=headers_for("tv", UA_DESKTOP),
             extractor_args={"youtube": {"player_client": ["tv"], "player_skip": ["configs"]}},
         )),
         ("tv_embedded", dict(
-            http_headers=_mk_headers(UA_DESKTOP),
+            http_headers=headers_for("tv_embedded", UA_DESKTOP),
             extractor_args={"youtube": {"player_client": ["tv_embedded"], "player_skip": ["configs"]}},
         )),
     ]
@@ -644,13 +558,11 @@ def debug():
         supabase_enabled=_supabase_can_use(),
         env_yt=bool(os.getenv("YTDLP_COOKIES_B64")),
         env_ig=bool(os.getenv("IG_COOKIES_B64")),
-        env_yt_error=ENV_YT_ERROR,
         last_cookie_source=LAST_COOKIE_SOURCE,
         cookie_snapshot=LAST_COOKIE_SNAPSHOT[:20],
         auth_snapshot=AUTH_SNAPSHOT,
         auth_using=AUTH_USING,
         success_client=SUCCESS_CLIENT,
-        cookie_header_sample=COOKIE_HEADER_SAMPLE,
         path=os.environ.get("PATH", "")[:500],
     )
 
