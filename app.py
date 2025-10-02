@@ -1,3 +1,4 @@
+# app.py
 import os, tempfile, pathlib, base64, re, shutil, json
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from flask import Flask, request, send_file, jsonify
@@ -58,7 +59,7 @@ def _get_latest_cookies_from_supabase(domain_key: str) -> str | None:
         "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
     }
 
-    # esquema atual
+    # esquema atual (host, cookie_text)
     try:
         url = f"{SUPABASE_URL}/rest/v1/cookies"
         params = {
@@ -79,14 +80,16 @@ def _get_latest_cookies_from_supabase(domain_key: str) -> str | None:
 
 def _supabase_upsert_cookie(domain: str, cookies_txt: str) -> dict:
     """
-    Salva cookies no Supabase usando APENAS o esquema atual:
+    Salva cookies no Supabase usando o esquema atual:
       - tabela: cookies
       - colunas: host, cookie_text
+    Upsert real via on_conflict=host.
     """
     if not _supabase_can_use():
         return {"ok": False, "schema": None, "status": 400, "text": "SUPABASE not configured"}
 
-    url = f"{SUPABASE_URL}/rest/v1/cookies"
+    # on_conflict=host garante upsert; Prefer merge-duplicates mantém a semântica
+    url = f"{SUPABASE_URL}/rest/v1/cookies?on_conflict=host"
     headers = {
         "apikey": SUPABASE_ANON_KEY,
         "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
@@ -217,10 +220,8 @@ def _normalize_youtube_url(u: str) -> str:
         query = parse_qs(parsed.query, keep_blank_values=True)
 
         # shorts -> watch?v=
-        # /shorts/<ID>  -> https://www.youtube.com/watch?v=<ID>
         if "/shorts/" in path:
             parts = path.strip("/").split("/")
-            # ex: ["shorts", "ULO37OgWv6c"]
             if len(parts) >= 2 and parts[0] == "shorts":
                 vid = parts[1]
                 path = "/watch"
@@ -263,7 +264,7 @@ def _download_best_audio(url: str, cookies_txt: str | None, prefer_cookie_source
     outtpl = os.path.join(tmpdir, "%(id)s.%(ext)s")
     cookiefile = _choose_cookiefile(url, cookies_txt, prefer_cookie_source)
 
-    # --- Normaliza YouTube (Shorts -> watch, flags has_verified/bpctr) ---
+    # Normaliza YouTube (Shorts -> watch, flags has_verified/bpctr)
     url = _normalize_youtube_url(url)
 
     host = (urlparse(url).netloc or "").lower()
@@ -296,6 +297,7 @@ def _download_best_audio(url: str, cookies_txt: str | None, prefer_cookie_source
 
     pick_fmt = yt_fmt if ("youtu" in host) else ig_fmt if ("instagram" in host) else tk_fmt if ("tiktok" in host) else fb_fmt
 
+    # 1) ANDROID
     try:
         _run({
             "outtmpl": outtpl,
@@ -316,6 +318,7 @@ def _download_best_audio(url: str, cookies_txt: str | None, prefer_cookie_source
             "noprogress": True,
         })
     except Exception as e_android:
+        # 2) WEB
         try:
             _run({
                 "outtmpl": outtpl,
@@ -343,6 +346,7 @@ def _download_best_audio(url: str, cookies_txt: str | None, prefer_cookie_source
                 hint = " • YouTube pode exigir cookies (YTDLP_COOKIES_B64 ou Supabase host=youtube.com)."
             raise RuntimeError(f"Download falhou. ANDROID: {e_android} | WEB: {e_web}{hint}")
 
+    # escolhe arquivo sem reencodar
     for ext in ("m4a", "webm", "opus", "mp3", "mp4", "mkv"):
         files = list(pathlib.Path(tmpdir).glob(f"*.{ext}"))
         if files:
