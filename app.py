@@ -557,4 +557,5 @@ def cookies_fetch():
 
 # ===================== Run (local) =====================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8000")))
+    # Use string como default e converte p/ int para evitar problemas de tipo
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
