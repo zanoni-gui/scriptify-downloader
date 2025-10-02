@@ -1,5 +1,5 @@
 # app.py
-import os, tempfile, pathlib, base64, re, shutil, json
+import os, tempfile, pathlib, base64, re, shutil, json, time, hashlib
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from flask import Flask, request, send_file, jsonify
 import yt_dlp
@@ -59,7 +59,6 @@ def _get_latest_cookies_from_supabase(domain_key: str) -> str | None:
         "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
     }
 
-    # esquema atual (host, cookie_text)
     try:
         url = f"{SUPABASE_URL}/rest/v1/cookies"
         params = {
@@ -80,10 +79,8 @@ def _get_latest_cookies_from_supabase(domain_key: str) -> str | None:
 
 def _supabase_upsert_cookie(domain: str, cookies_txt: str) -> dict:
     """
-    Salva cookies no Supabase usando o esquema atual:
-      - tabela: cookies
-      - colunas: host, cookie_text
-    Upsert real via on_conflict=host.
+    Tabela: cookies (host, cookie_text)
+    Upsert via on_conflict=host.
     """
     if not _supabase_can_use():
         return {"ok": False, "schema": None, "status": 400, "text": "SUPABASE not configured"}
@@ -177,6 +174,7 @@ def _cookiefile_from_supabase(url: str) -> str | None:
     return tf.name
 
 LAST_COOKIE_SOURCE = "none"
+LAST_COOKIE_SNAPSHOT = []  # primeiras linhas do cookie realmente carregado
 
 def _ensure_consent_cookie(cookie_path: str) -> str:
     """
@@ -196,37 +194,39 @@ def _ensure_consent_cookie(cookie_path: str) -> str:
     tf.write(new_txt.encode("utf-8")); tf.flush(); tf.close()
     return tf.name
 
-def _cookie_header_from_file(cookie_path: str, domain_hint: str) -> str | None:
+def _read_cookie_value(cookie_path: str, names: list[str]) -> str | None:
     """
-    Constrói um header 'Cookie' a partir de um arquivo Netscape.
-    Usa somente cookies do domínio indicado (ex.: 'youtube.com').
+    Lê o valor do último cookie cujo nome está em `names`.
     """
     try:
-        lines = pathlib.Path(cookie_path).read_text("utf-8", "ignore").splitlines()
+        with open(cookie_path, "r", encoding="utf-8", errors="ignore") as f:
+            val = None
+            for line in f:
+                if not line or line.startswith("#"): 
+                    continue
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) >= 7:
+                    name, v = parts[5], parts[6]
+                    if name in names and v:
+                        val = v
+            return val
     except Exception:
         return None
-    pairs = []
-    domain_pat = re.compile(rf"(?:^|\.){re.escape(domain_hint)}$", re.I)
-    for ln in lines:
-        if not ln or ln.startswith("#"): 
-            continue
-        cols = ln.split("\t")
-        if len(cols) < 7:
-            continue
-        domain, _flag, _path, _secure, _expiry, name, val = cols[:7]
-        d = domain.lstrip(".").lower()
-        if domain_pat.search(d):
-            # ignora cookies vazios
-            if not name or val is None: 
-                continue
-            pairs.append(f"{name}={val}")
-    return "; ".join(pairs) if pairs else None
+
+def _sapisi_auth_header(origin: str, sapisid: str) -> str:
+    """
+    Authorization: SAPISIDHASH <ts>_<sha1(ts + ' ' + sapisid + ' ' + origin)>
+    """
+    ts = str(int(time.time()))
+    base = f"{ts} {sapisid} {origin}"
+    digest = hashlib.sha1(base.encode("utf-8")).hexdigest()
+    return f"SAPISIDHASH {ts}_{digest}"
 
 def _choose_cookiefile(url: str, cookies_txt: str | None, prefer: str = "auto") -> str | None:
     """
     prefer: 'auto' | 'request' | 'env' | 'supabase'
     """
-    global LAST_COOKIE_SOURCE
+    global LAST_COOKIE_SOURCE, LAST_COOKIE_SNAPSHOT
     sources = {
         "request": [_cookiefile_from_request, _cookiefile_from_env_for, _cookiefile_from_supabase],
         "env":     [_cookiefile_from_env_for, _cookiefile_from_request, _cookiefile_from_supabase],
@@ -248,6 +248,7 @@ def _choose_cookiefile(url: str, cookies_txt: str | None, prefer: str = "auto") 
             break
     if not cf_path:
         LAST_COOKIE_SOURCE = "none"
+        LAST_COOKIE_SNAPSHOT = []
         return None
 
     # Se YouTube, injeta CONSENT se faltar
@@ -257,6 +258,21 @@ def _choose_cookiefile(url: str, cookies_txt: str | None, prefer: str = "auto") 
             cf_path = _ensure_consent_cookie(cf_path)
         except Exception:
             pass
+
+    # Snapshot (primeiras 10 linhas não comentadas)
+    try:
+        lines = []
+        with open(cf_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if line.startswith("#") or not line.strip():
+                    continue
+                lines.append(line.strip())
+                if len(lines) >= 10:
+                    break
+        LAST_COOKIE_SNAPSHOT = lines
+    except Exception:
+        LAST_COOKIE_SNAPSHOT = []
+
     return cf_path
 
 # ===================== URL helpers (YouTube) =====================
@@ -331,7 +347,6 @@ def _download_best_audio(url: str, cookies_txt: str | None, prefer_cookie_source
         "https://www.facebook.com/"
     )
 
-    # 2 UAs: desktop e mobile
     UA_DESKTOP = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                   "AppleWebKit/537.36 (KHTML, like Gecko) "
                   "Chrome/126.0.0.0 Safari/537.36")
@@ -347,13 +362,15 @@ def _download_best_audio(url: str, cookies_txt: str | None, prefer_cookie_source
             "Origin": "https://www.youtube.com" if "youtu" in host else referer,
         }
 
-    # Constrói Cookie header manual (além do cookiefile) para reforçar passagem de auth
-    cookie_header = None
-    if cookiefile and ("youtube" in host or "youtu.be" in host):
-        try:
-            cookie_header = _cookie_header_from_file(cookiefile, "youtube.com")
-        except Exception:
-            cookie_header = None
+    # Se temos cookies com SAPISID, geramos Authorization: SAPISIDHASH
+    extra_auth_headers = {}
+    if cookiefile and ("youtu" in host):
+        sapisid = _read_cookie_value(cookiefile, ["SAPISID", "__Secure-3PAPISID", "__Secure-1PAPISID"])
+        if sapisid:
+            try:
+                extra_auth_headers["Authorization"] = _sapisi_auth_header("https://www.youtube.com", sapisid)
+            except Exception:
+                pass
 
     def _run(ydl_opts):
         if cookiefile:
@@ -367,37 +384,46 @@ def _download_best_audio(url: str, cookies_txt: str | None, prefer_cookie_source
     fb_fmt = "bestaudio[ext=m4a]/bestaudio/best"
     pick_fmt = yt_fmt if ("youtu" in host) else ig_fmt if ("instagram" in host) else tk_fmt if ("tiktok" in host) else fb_fmt
 
-    # Tenta vários clients do YouTube (ordem afinada p/ contornar “not a bot” e Shorts):
+    # Tentativas (ordem afinada)
     attempts = [
         ("mweb_embedded", dict(
-            http_headers=base_headers(UA_MOBILE),
+            http_headers={**base_headers(UA_MOBILE), **extra_auth_headers},
             extractor_args={"youtube": {"player_client": ["mweb"], "player_skip": ["configs"]}},
         )),
+        ("web_embedded", dict(
+            http_headers={**base_headers(UA_DESKTOP),
+                          "X-YouTube-Client-Name": "1",
+                          "X-YouTube-Client-Version": "2.20240901.00.00",
+                          **extra_auth_headers},
+            extractor_args={"youtube": {"player_client": ["web_embedded"], "player_skip": ["configs"]}},
+        )),
+        ("tv", dict(
+            http_headers={**base_headers(UA_DESKTOP), **extra_auth_headers},
+            extractor_args={"youtube": {"player_client": ["tv"], "player_skip": ["configs"]}},
+        )),
         ("tv_embedded", dict(
-            http_headers=base_headers(UA_DESKTOP),
+            http_headers={**base_headers(UA_DESKTOP), **extra_auth_headers},
             extractor_args={"youtube": {"player_client": ["tv_embedded"], "player_skip": ["configs"]}},
         )),
         ("web", dict(
             http_headers={**base_headers(UA_DESKTOP),
                           "X-YouTube-Client-Name": "1",
-                          "X-YouTube-Client-Version": "2.20240901.00.00"},
+                          "X-YouTube-Client-Version": "2.20240901.00.00",
+                          **extra_auth_headers},
             extractor_args={"youtube": {"player_client": ["web"], "player_skip": ["configs"]}},
         )),
         ("android", dict(
-            http_headers=base_headers(UA_MOBILE),
+            http_headers={**base_headers(UA_MOBILE), **extra_auth_headers},
             extractor_args={"youtube": {"player_client": ["android"], "player_skip": ["configs"]}},
         )),
         ("ios", dict(
-            http_headers=base_headers(UA_MOBILE),
+            http_headers={**base_headers(UA_MOBILE), **extra_auth_headers},
             extractor_args={"youtube": {"player_client": ["ios"], "player_skip": ["configs"]}},
         )),
     ]
 
     errors: list[str] = []
     for label, extra in attempts:
-        headers = dict(extra["http_headers"])
-        if cookie_header and "youtube" in host:
-            headers["Cookie"] = cookie_header  # reforço
         ydl_opts = {
             "outtmpl": outtpl,
             "quiet": True, "no_warnings": True, "noplaylist": True,
@@ -405,7 +431,7 @@ def _download_best_audio(url: str, cookies_txt: str | None, prefer_cookie_source
             "retries": 6, "socket_timeout": 30,
             "concurrent_fragment_downloads": 1, "force_ipv4": True,
             "http_chunk_size": 10 * 1024 * 1024,
-            "http_headers": headers,
+            "http_headers": extra["http_headers"],
             "prefer_ffmpeg": True,
             "ffmpeg_location": ffmpeg_location_for_ytdlp() or "ffmpeg",
             "extractor_args": extra["extractor_args"],
@@ -497,6 +523,7 @@ def debug():
         env_yt=bool(os.getenv("YTDLP_COOKIES_B64")),
         env_ig=bool(os.getenv("IG_COOKIES_B64")),
         last_cookie_source=LAST_COOKIE_SOURCE,
+        cookie_snapshot=LAST_COOKIE_SNAPSHOT[:10],
         path=os.environ.get("PATH", "")[:500],
     )
 
@@ -530,4 +557,4 @@ def cookies_fetch():
 
 # ===================== Run (local) =====================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8000")))
