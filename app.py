@@ -196,6 +196,32 @@ def _ensure_consent_cookie(cookie_path: str) -> str:
     tf.write(new_txt.encode("utf-8")); tf.flush(); tf.close()
     return tf.name
 
+def _cookie_header_from_file(cookie_path: str, domain_hint: str) -> str | None:
+    """
+    Constrói um header 'Cookie' a partir de um arquivo Netscape.
+    Usa somente cookies do domínio indicado (ex.: 'youtube.com').
+    """
+    try:
+        lines = pathlib.Path(cookie_path).read_text("utf-8", "ignore").splitlines()
+    except Exception:
+        return None
+    pairs = []
+    domain_pat = re.compile(rf"(?:^|\.){re.escape(domain_hint)}$", re.I)
+    for ln in lines:
+        if not ln or ln.startswith("#"): 
+            continue
+        cols = ln.split("\t")
+        if len(cols) < 7:
+            continue
+        domain, _flag, _path, _secure, _expiry, name, val = cols[:7]
+        d = domain.lstrip(".").lower()
+        if domain_pat.search(d):
+            # ignora cookies vazios
+            if not name or val is None: 
+                continue
+            pairs.append(f"{name}={val}")
+    return "; ".join(pairs) if pairs else None
+
 def _choose_cookiefile(url: str, cookies_txt: str | None, prefer: str = "auto") -> str | None:
     """
     prefer: 'auto' | 'request' | 'env' | 'supabase'
@@ -321,6 +347,14 @@ def _download_best_audio(url: str, cookies_txt: str | None, prefer_cookie_source
             "Origin": "https://www.youtube.com" if "youtu" in host else referer,
         }
 
+    # Constrói Cookie header manual (além do cookiefile) para reforçar passagem de auth
+    cookie_header = None
+    if cookiefile and ("youtube" in host or "youtu.be" in host):
+        try:
+            cookie_header = _cookie_header_from_file(cookiefile, "youtube.com")
+        except Exception:
+            cookie_header = None
+
     def _run(ydl_opts):
         if cookiefile:
             ydl_opts["cookiefile"] = cookiefile
@@ -361,6 +395,9 @@ def _download_best_audio(url: str, cookies_txt: str | None, prefer_cookie_source
 
     errors: list[str] = []
     for label, extra in attempts:
+        headers = dict(extra["http_headers"])
+        if cookie_header and "youtube" in host:
+            headers["Cookie"] = cookie_header  # reforço
         ydl_opts = {
             "outtmpl": outtpl,
             "quiet": True, "no_warnings": True, "noplaylist": True,
@@ -368,7 +405,7 @@ def _download_best_audio(url: str, cookies_txt: str | None, prefer_cookie_source
             "retries": 6, "socket_timeout": 30,
             "concurrent_fragment_downloads": 1, "force_ipv4": True,
             "http_chunk_size": 10 * 1024 * 1024,
-            "http_headers": extra["http_headers"],
+            "http_headers": headers,
             "prefer_ffmpeg": True,
             "ffmpeg_location": ffmpeg_location_for_ytdlp() or "ffmpeg",
             "extractor_args": extra["extractor_args"],
