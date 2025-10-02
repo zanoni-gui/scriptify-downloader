@@ -174,7 +174,9 @@ def _cookiefile_from_supabase(url: str) -> str | None:
     return tf.name
 
 LAST_COOKIE_SOURCE = "none"
-LAST_COOKIE_SNAPSHOT = []  # primeiras linhas do cookie realmente carregado
+LAST_COOKIE_SNAPSHOT: list[str] = []   # primeiras linhas do cookie realmente carregado
+AUTH_SNAPSHOT: dict[str, str] = {}     # headers de auth gerados (p/ debug)
+AUTH_USING: str | None = None          # qual cookie baseou o SAPISIDHASH
 
 def _ensure_consent_cookie(cookie_path: str) -> str:
     """
@@ -194,33 +196,43 @@ def _ensure_consent_cookie(cookie_path: str) -> str:
     tf.write(new_txt.encode("utf-8")); tf.flush(); tf.close()
     return tf.name
 
-def _read_cookie_value(cookie_path: str, names: list[str]) -> str | None:
+def _read_cookies_map(cookie_path: str) -> dict[str, str]:
     """
-    Lê o valor do último cookie cujo nome está em `names`.
+    Lê um cookie file (Netscape) e retorna um dict {name: value} (última ocorrência).
     """
+    mp: dict[str, str] = {}
     try:
         with open(cookie_path, "r", encoding="utf-8", errors="ignore") as f:
-            val = None
-            for line in f:
-                if not line or line.startswith("#"): 
+            for ln in f:
+                if not ln or ln.startswith("#"): 
                     continue
-                parts = line.rstrip("\n").split("\t")
-                if len(parts) >= 7:
-                    name, v = parts[5], parts[6]
-                    if name in names and v:
-                        val = v
-            return val
+                parts = re.split(r"\s+", ln.strip(), maxsplit=6)
+                if len(parts) < 7:
+                    continue
+                name, value = parts[5], parts[6]
+                mp[name] = value
     except Exception:
-        return None
+        return {}
+    return mp
 
-def _sapisi_auth_header(origin: str, sapisid: str) -> str:
+def _build_sapisidhash_headers(origin: str, cookie_path: str) -> tuple[dict[str, str], str | None]:
     """
-    Authorization: SAPISIDHASH <ts>_<sha1(ts + ' ' + sapisid + ' ' + origin)>
+    Monta headers Authorization SAPISIDHASH a partir de SAPISID / __Secure-3PAPISID / __Secure-1PAPISID.
+    Retorna ({headers}, "cookie_usado_ou_None")
     """
+    cookies = _read_cookies_map(cookie_path)
+    sapikey = cookies.get("SAPISID") or cookies.get("__Secure-3PAPISID") or cookies.get("__Secure-1PAPISID")
+    if not sapikey:
+        return ({}, None)
     ts = str(int(time.time()))
-    base = f"{ts} {sapisid} {origin}"
-    digest = hashlib.sha1(base.encode("utf-8")).hexdigest()
-    return f"SAPISIDHASH {ts}_{digest}"
+    dig = hashlib.sha1(f"{ts} {sapikey} {origin}".encode("utf-8")).hexdigest()
+    headers = {
+        "Authorization": f"SAPISIDHASH {ts}_{dig}",
+        "X-Origin": origin,
+        "X-Goog-AuthUser": "0",
+    }
+    used = "SAPISID" if cookies.get("SAPISID") else "__Secure-3PAPISID" if cookies.get("__Secure-3PAPISID") else "__Secure-1PAPISID"
+    return (headers, used)
 
 def _choose_cookiefile(url: str, cookies_txt: str | None, prefer: str = "auto") -> str | None:
     """
@@ -251,15 +263,13 @@ def _choose_cookiefile(url: str, cookies_txt: str | None, prefer: str = "auto") 
         LAST_COOKIE_SNAPSHOT = []
         return None
 
-    # Se YouTube, injeta CONSENT se faltar
+    # Se YouTube, injeta CONSENT se faltar e guarda snapshot
     host = (urlparse(url).netloc or "").lower()
     if "youtube.com" in host or "youtu.be" in host:
         try:
             cf_path = _ensure_consent_cookie(cf_path)
         except Exception:
             pass
-
-    # Snapshot (primeiras 10 linhas não comentadas)
     try:
         lines = []
         with open(cf_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -267,7 +277,7 @@ def _choose_cookiefile(url: str, cookies_txt: str | None, prefer: str = "auto") 
                 if line.startswith("#") or not line.strip():
                     continue
                 lines.append(line.strip())
-                if len(lines) >= 10:
+                if len(lines) >= 20:
                     break
         LAST_COOKIE_SNAPSHOT = lines
     except Exception:
@@ -362,15 +372,16 @@ def _download_best_audio(url: str, cookies_txt: str | None, prefer_cookie_source
             "Origin": "https://www.youtube.com" if "youtu" in host else referer,
         }
 
-    # Se temos cookies com SAPISID, geramos Authorization: SAPISIDHASH
-    extra_auth_headers = {}
-    if cookiefile and ("youtu" in host):
-        sapisid = _read_cookie_value(cookiefile, ["SAPISID", "__Secure-3PAPISID", "__Secure-1PAPISID"])
-        if sapisid:
-            try:
-                extra_auth_headers["Authorization"] = _sapisi_auth_header("https://www.youtube.com", sapisid)
-            except Exception:
-                pass
+    # Headers de autenticação SAPISIDHASH se possível
+    global AUTH_SNAPSHOT, AUTH_USING
+    AUTH_SNAPSHOT, AUTH_USING = {}, None
+    extra_auth_headers: dict[str, str] = {}
+    if cookiefile and ("youtube" in host or "youtu.be" in host):
+        try:
+            extra_auth_headers, AUTH_USING = _build_sapisidhash_headers("https://www.youtube.com", cookiefile)
+            AUTH_SNAPSHOT = dict(extra_auth_headers)
+        except Exception:
+            AUTH_SNAPSHOT, AUTH_USING = {}, None
 
     def _run(ydl_opts):
         if cookiefile:
@@ -384,7 +395,7 @@ def _download_best_audio(url: str, cookies_txt: str | None, prefer_cookie_source
     fb_fmt = "bestaudio[ext=m4a]/bestaudio/best"
     pick_fmt = yt_fmt if ("youtu" in host) else ig_fmt if ("instagram" in host) else tk_fmt if ("tiktok" in host) else fb_fmt
 
-    # Tentativas (ordem afinada)
+    # Tentativas com diferentes clients
     attempts = [
         ("mweb_embedded", dict(
             http_headers={**base_headers(UA_MOBILE), **extra_auth_headers},
@@ -523,7 +534,9 @@ def debug():
         env_yt=bool(os.getenv("YTDLP_COOKIES_B64")),
         env_ig=bool(os.getenv("IG_COOKIES_B64")),
         last_cookie_source=LAST_COOKIE_SOURCE,
-        cookie_snapshot=LAST_COOKIE_SNAPSHOT[:10],
+        cookie_snapshot=LAST_COOKIE_SNAPSHOT[:20],
+        auth_snapshot=AUTH_SNAPSHOT,
+        auth_using=AUTH_USING,
         path=os.environ.get("PATH", "")[:500],
     )
 
@@ -557,5 +570,4 @@ def cookies_fetch():
 
 # ===================== Run (local) =====================
 if __name__ == "__main__":
-    # Use string como default e converte p/ int para evitar problemas de tipo
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
