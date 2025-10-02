@@ -1,5 +1,5 @@
 import os, tempfile, pathlib, base64, re, shutil, json
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from flask import Flask, request, send_file, jsonify
 import yt_dlp
 import requests  # Supabase REST
@@ -177,6 +177,9 @@ def _cookiefile_from_supabase(url: str) -> str | None:
 LAST_COOKIE_SOURCE = "none"
 
 def _choose_cookiefile(url: str, cookies_txt: str | None, prefer: str = "auto") -> str | None:
+    """
+    prefer: 'auto' | 'request' | 'env' | 'supabase'
+    """
     global LAST_COOKIE_SOURCE
     sources = {
         "request": [_cookiefile_from_request, _cookiefile_from_env_for, _cookiefile_from_supabase],
@@ -198,6 +201,51 @@ def _choose_cookiefile(url: str, cookies_txt: str | None, prefer: str = "auto") 
     LAST_COOKIE_SOURCE = "none"
     return None
 
+# ===================== URL helpers (YouTube) =====================
+def _normalize_youtube_url(u: str) -> str:
+    """
+    - Converte /shorts/ID para watch?v=ID
+    - Garante has_verified=1 e bpctr=9999999999
+    """
+    try:
+        parsed = urlparse(u)
+        host = (parsed.netloc or "").lower()
+        if "youtube.com" not in host and "youtu.be" not in host:
+            return u
+
+        path = parsed.path or ""
+        query = parse_qs(parsed.query, keep_blank_values=True)
+
+        # shorts -> watch?v=
+        # /shorts/<ID>  -> https://www.youtube.com/watch?v=<ID>
+        if "/shorts/" in path:
+            parts = path.strip("/").split("/")
+            # ex: ["shorts", "ULO37OgWv6c"]
+            if len(parts) >= 2 and parts[0] == "shorts":
+                vid = parts[1]
+                path = "/watch"
+                query["v"] = [vid]
+
+        # youtu.be/<ID> -> watch?v=<ID>
+        if "youtu.be" in host and not query.get("v"):
+            vid = path.strip("/").split("/")[0] if path.strip("/") else ""
+            if vid:
+                host = "www.youtube.com"
+                path = "/watch"
+                query["v"] = [vid]
+
+        # flags anti-verificação
+        if "has_verified" not in query:
+            query["has_verified"] = ["1"]
+        if "bpctr" not in query:
+            query["bpctr"] = ["9999999999"]
+
+        new_q = urlencode({k: v[0] if isinstance(v, list) and len(v) == 1 else v for k, v in query.items()}, doseq=True)
+        normalized = urlunparse((parsed.scheme or "https", host, path, "", new_q, ""))
+        return normalized
+    except Exception:
+        return u
+
 # ===================== Download (yt-dlp) =====================
 def _guess_mimetype(path: str) -> str:
     ext = pathlib.Path(path).suffix.lower()
@@ -214,6 +262,9 @@ def _download_best_audio(url: str, cookies_txt: str | None, prefer_cookie_source
     tmpdir = tempfile.mkdtemp()
     outtpl = os.path.join(tmpdir, "%(id)s.%(ext)s")
     cookiefile = _choose_cookiefile(url, cookies_txt, prefer_cookie_source)
+
+    # --- Normaliza YouTube (Shorts -> watch, flags has_verified/bpctr) ---
+    url = _normalize_youtube_url(url)
 
     host = (urlparse(url).netloc or "").lower()
     referer = (
