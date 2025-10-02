@@ -171,16 +171,14 @@ def _cookiefile_from_supabase(url: str) -> str | None:
     return tf.name
 
 LAST_COOKIE_SOURCE = "none"
-LAST_COOKIE_SNAPSHOT: list[str] = []   # primeiras linhas do cookie realmente carregado
-AUTH_SNAPSHOT: dict[str, str] = {}     # headers de auth gerados (p/ debug)
-AUTH_USING: str | None = None          # qual cookie baseou o SAPISIDHASH
-SUCCESS_CLIENT: str | None = None      # rótulo do client que funcionou
+LAST_COOKIE_SNAPSHOT: list[str] = []
+AUTH_SNAPSHOT: dict[str, str] = {}
+AUTH_USING: str | None = None
+SUCCESS_CLIENT: str | None = None
+LAST_ERRORS: list[str] = []
+LAST_HEADERS_USED: dict = {}
 
 def _ensure_consent_cookie(cookie_path: str) -> str:
-    """
-    Garante que o cookie CONSENT exista (ajuda a evitar 'not a bot').
-    Retorna o caminho (pode ser o mesmo ou um arquivo temporário ajustado).
-    """
     try:
         txt = pathlib.Path(cookie_path).read_text("utf-8", "ignore")
     except Exception:
@@ -195,14 +193,11 @@ def _ensure_consent_cookie(cookie_path: str) -> str:
     return tf.name
 
 def _read_cookies_map(cookie_path: str) -> dict[str, str]:
-    """
-    Lê um cookie file (Netscape) e retorna um dict {name: value} (última ocorrência).
-    """
     mp: dict[str, str] = {}
     try:
         with open(cookie_path, "r", encoding="utf-8", errors="ignore") as f:
             for ln in f:
-                if not ln or ln.startswith("#"): 
+                if not ln or ln.startswith("#"):
                     continue
                 parts = re.split(r"\s+", ln.strip(), maxsplit=6)
                 if len(parts) < 7:
@@ -214,10 +209,6 @@ def _read_cookies_map(cookie_path: str) -> dict[str, str]:
     return mp
 
 def _build_sapisidhash_headers(origin: str, cookie_path: str) -> tuple[dict[str, str], str | None]:
-    """
-    Monta headers Authorization SAPISIDHASH a partir de SAPISID / __Secure-3PAPISID / __Secure-1PAPISID.
-    Retorna ({headers}, "cookie_usado_ou_None")
-    """
     cookies = _read_cookies_map(cookie_path)
     sapikey = cookies.get("SAPISID") or cookies.get("__Secure-3PAPISID") or cookies.get("__Secure-1PAPISID")
     if not sapikey:
@@ -233,9 +224,6 @@ def _build_sapisidhash_headers(origin: str, cookie_path: str) -> tuple[dict[str,
     return (headers, used)
 
 def _choose_cookiefile(url: str, cookies_txt: str | None, prefer: str = "auto") -> str | None:
-    """
-    prefer: 'auto' | 'request' | 'env' | 'supabase'
-    """
     global LAST_COOKIE_SOURCE, LAST_COOKIE_SNAPSHOT
     sources = {
         "request": [_cookiefile_from_request, _cookiefile_from_env_for, _cookiefile_from_supabase],
@@ -261,7 +249,6 @@ def _choose_cookiefile(url: str, cookies_txt: str | None, prefer: str = "auto") 
         LAST_COOKIE_SNAPSHOT = []
         return None
 
-    # Se YouTube, injeta CONSENT se faltar e guarda snapshot
     host = (urlparse(url).netloc or "").lower()
     if "youtube.com" in host or "youtu.be" in host:
         try:
@@ -285,10 +272,6 @@ def _choose_cookiefile(url: str, cookies_txt: str | None, prefer: str = "auto") 
 
 # ===================== URL helpers (YouTube) =====================
 def _normalize_youtube_url(u: str) -> str:
-    """
-    - Converte /shorts/ID para watch?v=ID
-    - Garante has_verified=1 e bpctr=9999999999
-    """
     try:
         parsed = urlparse(u)
         host = (parsed.netloc or "").lower()
@@ -298,7 +281,6 @@ def _normalize_youtube_url(u: str) -> str:
         path = parsed.path or ""
         query = parse_qs(parsed.query, keep_blank_values=True)
 
-        # shorts -> watch?v=
         if "/shorts/" in path:
             parts = path.strip("/").split("/")
             if len(parts) >= 2 and parts[0] == "shorts":
@@ -306,7 +288,6 @@ def _normalize_youtube_url(u: str) -> str:
                 path = "/watch"
                 query["v"] = [vid]
 
-        # youtu.be/<ID> -> watch?v=<ID>
         if "youtu.be" in host and not query.get("v"):
             vid = path.strip("/").split("/")[0] if path.strip("/") else ""
             if vid:
@@ -314,7 +295,6 @@ def _normalize_youtube_url(u: str) -> str:
                 path = "/watch"
                 query["v"] = [vid]
 
-        # flags anti-verificação
         if "has_verified" not in query:
             query["has_verified"] = ["1"]
         if "bpctr" not in query:
@@ -342,7 +322,6 @@ def _download_best_audio(url: str, cookies_txt: str | None, prefer_cookie_source
     tmpdir = tempfile.mkdtemp()
     outtpl = os.path.join(tmpdir, "%(id)s.%(ext)s")
 
-    # Normaliza YouTube
     url = _normalize_youtube_url(url)
 
     cookiefile = _choose_cookiefile(url, cookies_txt, prefer_cookie_source)
@@ -355,13 +334,12 @@ def _download_best_audio(url: str, cookies_txt: str | None, prefer_cookie_source
         "https://www.facebook.com/"
     )
 
-    # UAs
     UA_DESKTOP = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                   "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/126.0.0.0 Safari/537.36")
+                  "Chrome/124.0.0.0 Safari/537.36")
     UA_MOBILE = ("Mozilla/5.0 (Linux; Android 10; K) "
                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                 "Chrome/126.0.0.0 Mobile Safari/537.36")
+                 "Chrome/124.0.0.0 Mobile Safari/537.36")
 
     def base_headers(ua=UA_DESKTOP):
         return {
@@ -371,10 +349,11 @@ def _download_best_audio(url: str, cookies_txt: str | None, prefer_cookie_source
             "Origin": "https://www.youtube.com" if "youtu" in host else referer,
         }
 
-    # Auth (SAPISIDHASH) se possível
-    global AUTH_SNAPSHOT, AUTH_USING, SUCCESS_CLIENT
+    global AUTH_SNAPSHOT, AUTH_USING, SUCCESS_CLIENT, LAST_ERRORS, LAST_HEADERS_USED
     AUTH_SNAPSHOT, AUTH_USING = {}, None
     SUCCESS_CLIENT = None
+    LAST_ERRORS = []
+    LAST_HEADERS_USED = {}
 
     extra_auth_headers: dict[str, str] = {}
     if cookiefile and ("youtube" in host or "youtu.be" in host):
@@ -384,17 +363,19 @@ def _download_best_audio(url: str, cookies_txt: str | None, prefer_cookie_source
         except Exception:
             AUTH_SNAPSHOT, AUTH_USING = {}, None
 
-    # Cabeçalhos por client (sem header Cookie manual!)
     def headers_for(client: str, ua: str):
         hdrs = {**base_headers(ua), **extra_auth_headers}
-        # X-YouTube-Client-Name/Version coerentes com client
+        # X-YouTube-Client-Name/Version por client
         if client == "web":
             hdrs["X-YouTube-Client-Name"] = "1"
-            hdrs["X-YouTube-Client-Version"] = "2.20241001.00.00"
+            hdrs["X-YouTube-Client-Version"] = "2.20240901.00.00"
         elif client == "mweb":
             hdrs["X-YouTube-Client-Name"] = "2"
-            hdrs["X-YouTube-Client-Version"] = "2.20241001.00.00"
+            hdrs["X-YouTube-Client-Version"] = "2.20240901.00.00"
         elif client == "android":
+            hdrs["X-YouTube-Client-Name"] = "3"
+            hdrs["X-YouTube-Client-Version"] = "19.33.37"
+        elif client == "android_embedded":
             hdrs["X-YouTube-Client-Name"] = "3"
             hdrs["X-YouTube-Client-Version"] = "19.33.37"
         elif client == "ios":
@@ -402,15 +383,7 @@ def _download_best_audio(url: str, cookies_txt: str | None, prefer_cookie_source
             hdrs["X-YouTube-Client-Version"] = "19.09.3"
         elif client in ("tv", "tv_embedded", "web_embedded"):
             hdrs["X-YouTube-Client-Name"] = "1"
-            hdrs["X-YouTube-Client-Version"] = "2.20241001.00.00"
-        # alguns headers de navegação comuns
-        hdrs.update({
-            "sec-fetch-site": "same-origin",
-            "sec-fetch-mode": "navigate",
-            "sec-fetch-user": "?1",
-            "sec-fetch-dest": "document",
-            "upgrade-insecure-requests": "1",
-        })
+            hdrs["X-YouTube-Client-Version"] = "2.20240901.00.00"
         return hdrs
 
     def _run(ydl_opts):
@@ -425,40 +398,44 @@ def _download_best_audio(url: str, cookies_txt: str | None, prefer_cookie_source
     fb_fmt = "bestaudio[ext=m4a]/bestaudio/best"
     pick_fmt = yt_fmt if ("youtu" in host) else ig_fmt if ("instagram" in host) else tk_fmt if ("tiktok" in host) else fb_fmt
 
-    # Tentativas com diferentes clients
-    attempts = [
-        ("web", dict(
-            http_headers=headers_for("web", UA_DESKTOP),
-            extractor_args={"youtube": {"player_client": ["web"], "player_skip": ["configs"]}},
-        )),
-        ("mweb", dict(
-            http_headers=headers_for("mweb", UA_MOBILE),
-            extractor_args={"youtube": {"player_client": ["mweb"], "player_skip": ["configs"]}},
-        )),
-        ("web_embedded", dict(
-            http_headers=headers_for("web_embedded", UA_DESKTOP),
-            extractor_args={"youtube": {"player_client": ["web_embedded"], "player_skip": ["configs"]}},
-        )),
-        ("android", dict(
-            http_headers=headers_for("android", UA_MOBILE),
-            extractor_args={"youtube": {"player_client": ["android"], "player_skip": ["configs"]}},
-        )),
-        ("ios", dict(
-            http_headers=headers_for("ios", UA_MOBILE),
-            extractor_args={"youtube": {"player_client": ["ios"], "player_skip": ["configs"]}},
-        )),
-        ("tv", dict(
-            http_headers=headers_for("tv", UA_DESKTOP),
-            extractor_args={"youtube": {"player_client": ["tv"], "player_skip": ["configs"]}},
-        )),
-        ("tv_embedded", dict(
-            http_headers=headers_for("tv_embedded", UA_DESKTOP),
-            extractor_args={"youtube": {"player_client": ["tv_embedded"], "player_skip": ["configs"]}},
-        )),
+    # permitir forçar um client via parâmetro (pra debug)
+    forced_client = None
+    try:
+        if request.method == "GET":
+            forced_client = (request.args.get("yt_client") or "").strip().lower() or None
+        else:
+            body = request.get_json(silent=True) or {}
+            forced_client = (body.get("yt_client") or "").strip().lower() or None
+    except Exception:
+        forced_client = None
+
+    all_attempts = [
+        ("web", {"ua": UA_DESKTOP, "client": "web",
+                 "extractor_args": {"youtube": {"player_client": ["web"], "player_skip": ["configs"]}}}),
+        ("mweb", {"ua": UA_MOBILE, "client": "mweb",
+                  "extractor_args": {"youtube": {"player_client": ["mweb"], "player_skip": ["configs"]}}}),
+        ("web_embedded", {"ua": UA_DESKTOP, "client": "web_embedded",
+                          "extractor_args": {"youtube": {"player_client": ["web_embedded"], "player_skip": ["configs"]}}}),
+        ("android", {"ua": UA_MOBILE, "client": "android",
+                     "extractor_args": {"youtube": {"player_client": ["android"], "player_skip": ["configs"]}}}),
+        ("android_embedded", {"ua": UA_MOBILE, "client": "android_embedded",
+                              "extractor_args": {"youtube": {"player_client": ["android_embedded"], "player_skip": ["configs"]}}}),
+        ("ios", {"ua": UA_MOBILE, "client": "ios",
+                 "extractor_args": {"youtube": {"player_client": ["ios"], "player_skip": ["configs"]}}}),
+        ("tv", {"ua": UA_DESKTOP, "client": "tv",
+                "extractor_args": {"youtube": {"player_client": ["tv"], "player_skip": ["configs"]}}}),
+        ("tv_embedded", {"ua": UA_DESKTOP, "client": "tv_embedded",
+                         "extractor_args": {"youtube": {"player_client": ["tv_embedded"], "player_skip": ["configs"]}}}),
     ]
 
+    if forced_client:
+        all_attempts = [a for a in all_attempts if a[0] == forced_client] or all_attempts
+
     errors: list[str] = []
-    for label, extra in attempts:
+    for label, meta in all_attempts:
+        http_headers = headers_for(meta["client"], meta["ua"])
+        LAST_HEADERS_USED = {"label": label, **http_headers}  # debug
+
         ydl_opts = {
             "outtmpl": outtpl,
             "quiet": True, "no_warnings": True, "noplaylist": True,
@@ -466,10 +443,10 @@ def _download_best_audio(url: str, cookies_txt: str | None, prefer_cookie_source
             "retries": 6, "socket_timeout": 30,
             "concurrent_fragment_downloads": 1, "force_ipv4": True,
             "http_chunk_size": 10 * 1024 * 1024,
-            "http_headers": extra["http_headers"],
+            "http_headers": http_headers,
             "prefer_ffmpeg": True,
             "ffmpeg_location": ffmpeg_location_for_ytdlp() or "ffmpeg",
-            "extractor_args": extra["extractor_args"],
+            "extractor_args": meta["extractor_args"],
             "postprocessors": [],
             "allow_unplayable_formats": False,
             "noprogress": True,
@@ -479,7 +456,9 @@ def _download_best_audio(url: str, cookies_txt: str | None, prefer_cookie_source
             SUCCESS_CLIENT = label
             break  # sucesso
         except Exception as e:
-            errors.append(f"{label.upper()}: {e}")
+            msg = f"{label.upper()}: {e}"
+            errors.append(msg)
+            LAST_ERRORS.append(msg)
     else:
         hint = ""
         if "instagram" in host:
@@ -563,6 +542,8 @@ def debug():
         auth_snapshot=AUTH_SNAPSHOT,
         auth_using=AUTH_USING,
         success_client=SUCCESS_CLIENT,
+        last_errors=LAST_ERRORS[-8:],
+        last_headers_used=LAST_HEADERS_USED,
         path=os.environ.get("PATH", "")[:500],
     )
 
