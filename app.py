@@ -59,7 +59,6 @@ def _get_latest_cookies_from_supabase(domain_key: str) -> str | None:
         "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
     }
 
-    # esquema atual (host, cookie_text)
     try:
         url = f"{SUPABASE_URL}/rest/v1/cookies"
         params = {
@@ -79,12 +78,6 @@ def _get_latest_cookies_from_supabase(domain_key: str) -> str | None:
     return None
 
 def _supabase_upsert_cookie(domain: str, cookies_txt: str) -> dict:
-    """
-    Salva cookies no Supabase usando o esquema atual:
-      - tabela: cookies
-      - colunas: host, cookie_text
-    Upsert real via on_conflict=host.
-    """
     if not _supabase_can_use():
         return {"ok": False, "schema": None, "status": 400, "text": "SUPABASE not configured"}
 
@@ -179,9 +172,6 @@ def _cookiefile_from_supabase(url: str) -> str | None:
 LAST_COOKIE_SOURCE = "none"
 
 def _choose_cookiefile(url: str, cookies_txt: str | None, prefer: str = "auto") -> str | None:
-    """
-    prefer: 'auto' | 'request' | 'env' | 'supabase'
-    """
     global LAST_COOKIE_SOURCE
     sources = {
         "request": [_cookiefile_from_request, _cookiefile_from_env_for, _cookiefile_from_supabase],
@@ -218,7 +208,6 @@ def _normalize_youtube_url(u: str) -> str:
         path = parsed.path or ""
         query = parse_qs(parsed.query, keep_blank_values=True)
 
-        # shorts -> watch?v=
         if "/shorts/" in path:
             parts = path.strip("/").split("/")
             if len(parts) >= 2 and parts[0] == "shorts":
@@ -226,7 +215,6 @@ def _normalize_youtube_url(u: str) -> str:
                 path = "/watch"
                 query["v"] = [vid]
 
-        # youtu.be/<ID> -> watch?v=<ID>
         if "youtu.be" in host and not query.get("v"):
             vid = path.strip("/").split("/")[0] if path.strip("/") else ""
             if vid:
@@ -234,12 +222,10 @@ def _normalize_youtube_url(u: str) -> str:
                 path = "/watch"
                 query["v"] = [vid]
 
-        # flags anti-verificação
         if "has_verified" not in query:
             query["has_verified"] = ["1"]
         if "bpctr" not in query:
             query["bpctr"] = ["9999999999"]
-        # forçar idioma neutro para reduzir bloqueios
         query["hl"] = ["en"]
 
         new_q = urlencode({k: v[0] if isinstance(v, list) and len(v) == 1 else v for k, v in query.items()}, doseq=True)
@@ -265,25 +251,29 @@ def _download_best_audio(url: str, cookies_txt: str | None, prefer_cookie_source
     outtpl = os.path.join(tmpdir, "%(id)s.%(ext)s")
     cookiefile = _choose_cookiefile(url, cookies_txt, prefer_cookie_source)
 
-    # Normaliza YouTube (Shorts -> watch, flags, idioma)
     url = _normalize_youtube_url(url)
-
     host = (urlparse(url).netloc or "").lower()
+
+    # UAs/headers por cliente
+    UA_IOS = "com.google.ios.youtube/19.09.3 (iPhone; U; CPU iOS 16_6 like Mac OS X; en_US)"
+    UA_WEB = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+    UA_ANDROID = "com.google.android.youtube/19.09.39 (Linux; U; Android 13; en_US)"
+
+    def common_headers(ua: str, referer: str):
+        return {
+            "User-Agent": ua,
+            "Accept-Language": "en-US,en;q=0.8,pt-BR;q=0.6",
+            "Referer": referer,
+            "Origin": "https://www.youtube.com" if "youtu" in host else referer,
+        }
+
     referer = (
         "https://www.youtube.com/" if "youtu" in host else
         "https://www.instagram.com/" if "instagram" in host else
         "https://www.tiktok.com/" if "tiktok" in host else
         "https://www.facebook.com/"
     )
-
-    common_headers = {
-        "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                       "AppleWebKit/537.36 (KHTML, like Gecko) "
-                       "Chrome/126.0.0.0 Safari/537.36"),
-        "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Referer": referer,
-        "Origin": "https://www.youtube.com" if "youtu" in host else referer,
-    }
 
     def _run(ydl_opts):
         if cookiefile:
@@ -295,10 +285,9 @@ def _download_best_audio(url: str, cookies_txt: str | None, prefer_cookie_source
     ig_fmt = "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio/best"
     tk_fmt = "bestaudio[ext=m4a]/bestaudio/best"
     fb_fmt = "bestaudio[ext=m4a]/bestaudio/best"
-
     pick_fmt = yt_fmt if ("youtu" in host) else ig_fmt if ("instagram" in host) else tk_fmt if ("tiktok" in host) else fb_fmt
 
-    # ===== Tentativa 1: iOS (costuma furar bloqueio de Shorts) =====
+    # ===== Tentativa 1: iOS =====
     try:
         _run({
             "outtmpl": outtpl,
@@ -307,13 +296,15 @@ def _download_best_audio(url: str, cookies_txt: str | None, prefer_cookie_source
             "retries": 6, "socket_timeout": 30,
             "concurrent_fragment_downloads": 1, "force_ipv4": True,
             "http_chunk_size": 10 * 1024 * 1024,
-            "http_headers": {**common_headers},
+            "http_headers": {
+                **common_headers(UA_IOS, referer),
+                "X-YouTube-Client-Name": "5",          # iOS
+                "X-YouTube-Client-Version": "19.09.3",
+            },
             "prefer_ffmpeg": True,
             "ffmpeg_location": ffmpeg_location_for_ytdlp() or "ffmpeg",
-            "extractor_args": {
-                "youtube": {"player_client": ["ios"], "player_skip": ["configs"]},
-                "tiktok": {"download_api": ["Web"]},
-            },
+            "extractor_args": {"youtube": {"player_client": ["ios"], "player_skip": ["configs"]},
+                               "tiktok": {"download_api": ["Web"]}},
             "postprocessors": [],
             "allow_unplayable_formats": False,
             "noprogress": True,
@@ -328,9 +319,11 @@ def _download_best_audio(url: str, cookies_txt: str | None, prefer_cookie_source
                 "retries": 6, "socket_timeout": 30,
                 "concurrent_fragment_downloads": 1, "force_ipv4": True,
                 "http_chunk_size": 10 * 1024 * 1024,
-                "http_headers": {**common_headers,
-                                 "X-YouTube-Client-Name": "1",
-                                 "X-YouTube-Client-Version": "2.20240901.00.00"},
+                "http_headers": {
+                    **common_headers(UA_WEB, referer),
+                    "X-YouTube-Client-Name": "1",       # Web
+                    "X-YouTube-Client-Version": "2.20240901.00.00",
+                },
                 "prefer_ffmpeg": True,
                 "ffmpeg_location": ffmpeg_location_for_ytdlp() or "ffmpeg",
                 "extractor_args": {"youtube": {"player_client": ["web_embedded", "web"]},
@@ -349,7 +342,11 @@ def _download_best_audio(url: str, cookies_txt: str | None, prefer_cookie_source
                     "retries": 6, "socket_timeout": 30,
                     "concurrent_fragment_downloads": 1, "force_ipv4": True,
                     "http_chunk_size": 10 * 1024 * 1024,
-                    "http_headers": {**common_headers},
+                    "http_headers": {
+                        **common_headers(UA_ANDROID, referer),
+                        "X-YouTube-Client-Name": "3",   # Android
+                        "X-YouTube-Client-Version": "19.09.39",
+                    },
                     "prefer_ffmpeg": True,
                     "ffmpeg_location": ffmpeg_location_for_ytdlp() or "ffmpeg",
                     "extractor_args": {"youtube": {"player_client": ["android"], "player_skip": ["configs"]},
@@ -368,7 +365,6 @@ def _download_best_audio(url: str, cookies_txt: str | None, prefer_cookie_source
                     f"Download falhou. iOS: {e_ios} | WEB: {e_web} | ANDROID: {e_android}{hint}"
                 )
 
-    # escolhe arquivo sem reencodar
     for ext in ("m4a", "webm", "opus", "mp3", "mp4", "mkv"):
         files = list(pathlib.Path(tmpdir).glob(f"*.{ext}"))
         if files:
