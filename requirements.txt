@@ -3,3 +3,5 @@ yt-dlp==2024.09.27
 requests==2.32.3
 gunicorn==21.2.0
 imageio-ffmpeg==0.4.9
+Werkzeug==3.0.3
+openai>=1.37.0
