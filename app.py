@@ -124,20 +124,21 @@ def _build_ydl_opts(url: str, cookiefile: str | None):
 
     # YouTube
     if host == "youtube.com":
-        opts.setdefault("extractor_args", {}) \
-            .setdefault("youtube", {}) \
-            .setdefault("player_client", ["android", "web"])
+        ea = opts.setdefault("extractor_args", {}).setdefault("youtube", {})
+        # Emular vários clients ajuda a evitar 403/challenges:
+        ea.setdefault("player_client", ["android", "ios", "tvhtml5", "web"])
+        # Preferir M4A primeiro (mais estável p/ Whisper):
+        opts["format"] = "bestaudio[ext=m4a]/bestaudio/best"
         opts["nocheckcertificate"] = True
+        # Referer exato do vídeo + Origin
         opts["http_headers"].update({
             "Origin":  "https://www.youtube.com",
-            "Referer": "https://www.youtube.com/",
+            "Referer": url,  # watch URL exato
         })
 
     # Instagram
     if host == "instagram.com":
-        opts.setdefault("extractor_args", {}) \
-            .setdefault("instagram", {}) \
-            .setdefault("approximate_date", ["True"])
+        opts.setdefault("extractor_args", {}).setdefault("instagram", {}).setdefault("approximate_date", ["True"])
         opts["http_headers"].update({
             "Origin":           "https://www.instagram.com",
             "Referer":          "https://www.instagram.com/",
@@ -174,7 +175,7 @@ CT_TO_EXT = {
     "audio/ogg": "ogg",
     "audio/opus": "ogg",
     "audio/webm": "webm",
-    "video/mp4": "mp4",     # às vezes vem como vídeo com áudio embutido; Whisper aceita mp4
+    "video/mp4": "mp4",     # Whisper aceita mp4
     "video/webm": "webm",
     "application/octet-stream": None,
     "binary/octet-stream": None,
@@ -225,11 +226,13 @@ def _requests_headers_for(info: dict, page_url: str) -> dict:
             "Sec-Fetch-Dest":   "video",
         })
     elif host == "youtube.com":
+        # Referer deve ser o watch URL exato para evitar 403 em googlevideo
         hdrs.update({
-            "Referer": "https://www.youtube.com/",
+            "Referer": page_url,
             "Origin":  "https://www.youtube.com",
         })
 
+    # Mescla headers que o yt-dlp expuser (às vezes ajuda)
     if isinstance(info, dict) and isinstance(info.get("http_headers"), dict):
         hdrs.update(info["http_headers"])
 
