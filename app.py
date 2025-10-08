@@ -2,11 +2,12 @@
 import os
 import sys
 import time
+import re
 import json
 import tempfile
 import traceback
 from urllib.parse import urlparse
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -161,6 +162,114 @@ def _build_ydl_opts(url: str, cookiefile: str | None):
         _log(f"yt-dlp WITHOUT cookiefile for {host}")
 
     return opts
+
+
+# ======= LEGENDAS (YouTube) =======
+_CAP_LANG_PREF: List[str] = [
+    "pt", "pt-BR", "pt-PT",
+    "en", "en-US", "en-GB",
+    "es", "es-419"
+]
+
+_VTT_TS = re.compile(r"^\d{2}:\d{2}:\d{2}\.\d{3}\s-->\s\d{2}:\d{2}:\d{2}\.\d{3}")
+_SRT_IDX = re.compile(r"^\d+\s*$")
+_SRT_TS = re.compile(r"^\d{2}:\d{2}:\d{2},\d{3}\s-->\s\d{2}:\d{2}:\d{2},\d{3}")
+
+def _pick_caption_track(info: dict) -> Optional[str]:
+    """
+    Retorna a URL de uma trilha de legendas (subtitles/automatic_captions) priorizando PT/EN/ES.
+    """
+    def collect(tracks: dict) -> List[dict]:
+        items = []
+        if isinstance(tracks, dict):
+            for lang, lst in tracks.items():
+                if isinstance(lst, list):
+                    for it in lst:
+                        it2 = dict(it)
+                        it2["_lang"] = lang
+                        items.append(it2)
+        return items
+
+    subs = collect(info.get("subtitles"))
+    autos = collect(info.get("automatic_captions"))
+
+    # preferir subtitles (legenda enviada), depois auto
+    pool = subs + autos
+
+    # ordenar por nossa preferência de linguagem e por ext "vtt" primeiro
+    def score(it):
+        lang = (it.get("_lang") or "").lower()
+        try:
+            pref = _CAP_LANG_PREF.index(lang)
+        except ValueError:
+            pref = 999
+        ext = (it.get("ext") or "").lower()
+        ext_score = 0 if ext == "vtt" else 1
+        return (pref, ext_score)
+
+    pool.sort(key=score)
+
+    for it in pool:
+        url = it.get("url")
+        if url:
+            return url
+    return None
+
+def _vtt_to_text(vtt: str) -> str:
+    out = []
+    for line in vtt.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("WEBVTT"):
+            continue
+        if _VTT_TS.match(line):
+            continue
+        # Remove tags estilizadas <c> </c> etc
+        line = re.sub(r"<[^>]+>", "", line)
+        out.append(line)
+    # compactar cues repetidos
+    txt = "\n".join(out)
+    txt = re.sub(r"\n{3,}", "\n\n", txt)
+    return txt.strip()
+
+def _srt_to_text(srt: str) -> str:
+    out = []
+    for line in srt.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if _SRT_IDX.match(line):
+            continue
+        if _SRT_TS.match(line):
+            continue
+        out.append(line)
+    txt = "\n".join(out)
+    txt = re.sub(r"\n{3,}", "\n\n", txt)
+    return txt.strip()
+
+def _download_caption_text(cap_url: str, referer_page: str) -> Optional[str]:
+    hdrs = {
+        "User-Agent": UA,
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "keep-alive",
+        "Referer": referer_page,      # referer exato do watch
+        "Origin":  "https://www.youtube.com",
+    }
+    r = requests.get(cap_url, timeout=60, headers=hdrs)
+    r.raise_for_status()
+    ct = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+    body = r.text
+    if "vtt" in ct or body.lstrip().upper().startswith("WEBVTT"):
+        return _vtt_to_text(body)
+    if "srt" in ct:
+        return _srt_to_text(body)
+    # alguns endpoints retornam vtt sem content-type
+    if "WEBVTT" in body[:100].upper():
+        return _vtt_to_text(body)
+    # fallback “cru”
+    return body.strip() or None
 
 
 # ======= Download helpers (requests + fallback yt-dlp) =======
@@ -331,7 +440,7 @@ def transcribe():
     cookiefile = _cookies_for(url, cookies_text)
 
     try:
-        # 1) resolve URL do áudio (sem baixar)
+        # 1) resolve metadados (sem baixar)
         ydl_opts = _build_ydl_opts(url, cookiefile)
         host_can = _canonical_host(_domain(url))
         _log("ydl_opts for", host_can, json.dumps(ydl_opts.get("http_headers", {})))
@@ -342,6 +451,20 @@ def transcribe():
             platform  = info.get("extractor_key")
 
         _log("extracted", platform, "audio_url exists:", bool(audio_url))
+
+        # 1.5) TENTAR LEGENDAS (YouTube) ANTES DE TUDO
+        if host_can == "youtube.com":
+            cap_url = _pick_caption_track(info or {})
+            if cap_url:
+                try:
+                    cap_text = _download_caption_text(cap_url, referer_page=url)
+                    if cap_text and len(cap_text.strip()) > 40:
+                        _log("captions fetched successfully; skipping media download")
+                        return _json_ok({"transcript": {"text": cap_text}, "platform": platform})
+                except Exception as ce:
+                    _log("caption fetch failed:", repr(ce))
+            else:
+                _log("no captions available; will download media")
 
         audio_path: Optional[str] = None
 
