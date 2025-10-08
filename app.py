@@ -117,7 +117,6 @@ def _build_ydl_opts(url: str, cookiefile: str | None):
             .setdefault("youtube", {}) \
             .setdefault("player_client", ["android", "web"])
         opts["nocheckcertificate"] = True
-        # alguns endpoints HLS retornam melhor com estes cabeçalhos
         opts["http_headers"].update({
             "Origin":  "https://www.youtube.com",
             "Referer": "https://www.youtube.com/",
@@ -150,6 +149,49 @@ def _build_ydl_opts(url: str, cookiefile: str | None):
 
 
 # ======= Download helpers (requests + fallback yt-dlp) =======
+
+# mapa simples content-type -> extensão recomendada
+CT_TO_EXT = {
+    "audio/mpeg": "mp3",
+    "audio/mp3": "mp3",
+    "audio/mp4": "m4a",
+    "audio/aac": "m4a",
+    "audio/x-m4a": "m4a",
+    "audio/ogg": "ogg",
+    "audio/opus": "ogg",
+    "audio/webm": "webm",
+    "video/mp4": "mp4",
+    "video/webm": "webm",
+    "application/octet-stream": None,  # decidir pela URL
+    "binary/octet-stream": None,
+    "text/plain": None,  # pode ser playlist
+    "application/vnd.apple.mpegurl": "m3u8",  # playlist HLS
+    "application/x-mpegURL": "m3u8",         # playlist HLS
+}
+
+def _guess_ext_from_url(u: str) -> Optional[str]:
+    try:
+        p = urlparse(u).path.lower()
+    except Exception:
+        p = u.lower()
+    for ext in (".m4a", ".mp3", ".mp4", ".webm", ".wav", ".ogg", ".oga", ".mpeg", ".mpga"):
+        if p.endswith(ext):
+            return ext.lstrip(".")
+    # se contiver m3u8, indicar playlist
+    if ".m3u8" in p:
+        return "m3u8"
+    return None
+
+def _guess_ext(content_type: Optional[str], url: str) -> Optional[str]:
+    if content_type:
+        ct = content_type.split(";")[0].strip().lower()
+        if ct in CT_TO_EXT:
+            mapped = CT_TO_EXT[ct]
+            if mapped:
+                return mapped
+            # None => tentar URL
+    return _guess_ext_from_url(url)
+
 def _requests_headers_for(info: dict, page_url: str) -> dict:
     hdrs = {
         "User-Agent": UA,
@@ -185,9 +227,30 @@ def _requests_headers_for(info: dict, page_url: str) -> dict:
 
 
 def _download_to_tmp_via_requests(audio_url: str, headers: dict, max_mb: int = MAX_DOWNLOAD_MB) -> str:
-    tmp_path = os.path.join(tempfile.gettempdir(), f"sfy-audio-{int(time.time()*1000)}.bin")
+    """
+    Baixa o recurso apontado por audio_url. Se detectar playlist HLS (.m3u8),
+    lança exceção para forçar fallback pelo yt-dlp.
+    Garante salvar com extensão aceita pelo Whisper.
+    """
     with requests.get(audio_url, stream=True, timeout=90, headers=headers) as r:
         r.raise_for_status()
+
+        ct = r.headers.get("Content-Type", "").split(";")[0].strip().lower()
+        ext = _guess_ext(ct, audio_url)
+
+        # Se for playlist (m3u8) ou content-type suspeito, aborta para fallback
+        if ext == "m3u8" or ct in ("application/vnd.apple.mpegurl", "application/x-mpegurl"):
+            raise RuntimeError("is_m3u8_playlist")
+
+        # Se não conseguimos inferir, assume m4a (compatível na maioria dos casos)
+        if not ext:
+            ext = "m4a"
+
+        tmp_path = os.path.join(
+            tempfile.gettempdir(),
+            f"sfy-audio-{int(time.time()*1000)}.{ext}"
+        )
+
         size_mb = 0.0
         with open(tmp_path, "wb") as f:
             for chunk in r.iter_content(chunk_size=1024 * 256):
@@ -197,6 +260,7 @@ def _download_to_tmp_via_requests(audio_url: str, headers: dict, max_mb: int = M
                 size_mb += len(chunk) / (1024 * 1024)
                 if size_mb > max_mb:
                     raise RuntimeError("audio_too_large")
+
     return tmp_path
 
 
@@ -281,7 +345,7 @@ def transcribe():
 
         audio_path: Optional[str] = None
 
-        # Se não for forçado a usar o yt-dlp, tenta primeiro via requests com headers "browser-like"
+        # Tenta primeiro via requests (salvando com extensão válida)
         if not FORCE_YTDLP_DL and audio_url:
             headers = _requests_headers_for(info, url)
             try:
@@ -291,7 +355,7 @@ def transcribe():
                 _log("requests download failed:", repr(e))
                 audio_path = None  # fallback
 
-        # Fallback: deixa o ytdlp baixar o arquivo (mais resiliente)
+        # Fallback: deixa o ytdlp baixar o arquivo (resiliente p/ HLS/403)
         if not audio_path:
             audio_path = _download_to_tmp_fallback_with_ytdlp(url, ydl_opts)
             _log("download via ytdlp ok:", audio_path)
@@ -300,6 +364,7 @@ def transcribe():
         if not oai_client:
             raise RuntimeError("openai_client_not_initialized")
 
+        # Dica: a OpenAI checa a extensão do arquivo; agora sempre salvamos com ext suportada
         with open(audio_path, "rb") as f:
             tr = oai_client.audio.transcriptions.create(
                 model="whisper-1",
@@ -330,6 +395,8 @@ def transcribe():
         _log("RuntimeError:", code)
         if code == "audio_too_large":
             return _json_error("audio_too_large", 413, "Arquivo de áudio excedeu o limite.")
+        if code == "is_m3u8_playlist":
+            return _json_error("download_failed", 502, "Conteúdo é playlist HLS; usando fallback.")
         return _json_error("transcribe_failed", 500, detail=str(e))
 
     except Exception as e:
