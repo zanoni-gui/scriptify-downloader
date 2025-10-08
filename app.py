@@ -4,6 +4,7 @@ import time
 import tempfile
 import traceback
 from urllib.parse import urlparse
+from typing import Optional
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -13,7 +14,7 @@ import yt_dlp
 # ============== Config =================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 ALLOW_ORIGIN   = os.getenv("CORS_ALLOW_ORIGIN", "*")
-MAX_DOWNLOAD_MB = int(os.getenv("MAX_DOWNLOAD_MB", "80"))   # limite de download para o áudio
+MAX_DOWNLOAD_MB = int(os.getenv("MAX_DOWNLOAD_MB", "80"))   # limite de download para o áudio (MB)
 
 # OpenAI (SDK 1.x)
 try:
@@ -66,7 +67,7 @@ def _cookies_for(url: str, incoming_text: str | None) -> str | None:
         COOKIES_CACHE[dom] = {"path": path, "text": incoming_text, "ts": now}
         return path
 
-    # senão, tenta cache
+    # senão, tenta cache existente
     item = COOKIES_CACHE.get(dom)
     if item and now - item["ts"] < COOKIES_TTL:
         return item["path"]
@@ -85,9 +86,11 @@ COMMON_YDL = {
     "outtmpl": os.path.join(tempfile.gettempdir(), "sfy-%(id)s.%(ext)s"),
     "format": "bestaudio/best",
     "http_headers": {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/123.0 Safari/537.36"
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/123.0 Safari/537.36"
+        )
     },
 }
 
@@ -96,7 +99,7 @@ def _build_ydl_opts(url: str, cookiefile: str | None):
     opts = dict(COMMON_YDL)
 
     if "youtube.com" in host or "youtu.be" in host:
-        # melhora a taxa de sucesso sem login (ainda pode pedir cookies)
+        # melhora taxa de sucesso sem login (ainda pode pedir cookies)
         opts.setdefault("extractor_args", {}) \
             .setdefault("youtube", {}) \
             .setdefault("player_client", ["android", "web"])
@@ -114,10 +117,28 @@ def _build_ydl_opts(url: str, cookiefile: str | None):
     return opts
 
 
-# ======= Download de áudio (stream -> arquivo) =======
-def _download_to_tmp(audio_url: str) -> str:
-    tmp_path = os.path.join(tempfile.gettempdir(), f"sfy-audio-{int(time.time()*1000)}.m4a")
-    with requests.get(audio_url, stream=True, timeout=60) as r:
+# ======= Download helpers (requests + fallback yt-dlp) =======
+def _requests_headers_for(info: dict, page_url: str) -> dict:
+    hdrs = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/123.0 Safari/537.36"
+        )
+    }
+    host = _domain(page_url)
+    # TikTok frequentemente exige Referer/Origin
+    if "tiktok.com" in host:
+        hdrs["Referer"] = "https://www.tiktok.com/"
+        hdrs["Origin"]  = "https://www.tiktok.com"
+    # Se o yt-dlp expôs headers (às vezes traz cookies/UA), aproveita
+    if isinstance(info, dict) and isinstance(info.get("http_headers"), dict):
+        hdrs.update(info["http_headers"])
+    return hdrs
+
+def _download_to_tmp_via_requests(audio_url: str, headers: dict, max_mb: int = MAX_DOWNLOAD_MB) -> str:
+    tmp_path = os.path.join(tempfile.gettempdir(), f"sfy-audio-{int(time.time()*1000)}.bin")
+    with requests.get(audio_url, stream=True, timeout=60, headers=headers) as r:
         r.raise_for_status()
         size_mb = 0.0
         with open(tmp_path, "wb") as f:
@@ -126,9 +147,28 @@ def _download_to_tmp(audio_url: str) -> str:
                     continue
                 f.write(chunk)
                 size_mb += len(chunk) / (1024 * 1024)
-                if size_mb > MAX_DOWNLOAD_MB:
+                if size_mb > max_mb:
                     raise RuntimeError("audio_too_large")
     return tmp_path
+
+def _download_to_tmp_fallback_with_ytdlp(page_url: str, ydl_opts: dict) -> str:
+    """Se o link direto falhar, deixa o yt-dlp baixar o arquivo."""
+    outdir = tempfile.gettempdir()
+    ydl_opts = dict(ydl_opts)
+    ydl_opts["paths"] = {"home": outdir}
+    ydl_opts["outtmpl"] = os.path.join(outdir, "sfy-dl-%(id)s.%(ext)s")
+    ydl_opts["noplaylist"] = True
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(page_url, download=True)
+        path = ydl.prepare_filename(info)
+        if not os.path.exists(path):
+            # tenta pegar o arquivo mais recente começando com sfy-dl-
+            candidates = [os.path.join(outdir, f) for f in os.listdir(outdir) if f.startswith("sfy-dl-")]
+            if not candidates:
+                raise RuntimeError("download_file_missing")
+            path = max(candidates, key=os.path.getmtime)
+        return path
 
 
 # ======= Rotas =======
@@ -136,6 +176,27 @@ def _download_to_tmp(audio_url: str) -> str:
 @app.get("/health")
 def health():
     return "ok", 200
+
+@app.post("/cookies/set")
+def set_cookies():
+    """
+    Opcional: define cookies Netscape manualmente.
+    Body: { cookies: str, domains?: [ "youtube.com", "instagram.com", ... ] }
+    Se 'domains' não for enviado, aplica para youtube.com e instagram.com.
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    cookies_text = (data.get("cookies") or "").strip()
+    domains = data.get("domains") or ["youtube.com", "instagram.com"]
+
+    if not cookies_text:
+        return _json_error("missing_cookies", 400)
+
+    path = _save_cookies_text(cookies_text)
+    now = int(time.time())
+    for d in domains:
+        COOKIES_CACHE[d] = {"path": path, "text": cookies_text, "ts": now}
+
+    return _json_ok({"saved_for": domains})
 
 @app.post("/transcribe")
 def transcribe():
@@ -153,19 +214,27 @@ def transcribe():
     cookiefile = _cookies_for(url, cookies_text)
 
     try:
-        # 1) resolve URL do áudio com yt-dlp (sem baixar ainda)
+        # 1) resolve URL do áudio (sem baixar)
         ydl_opts = _build_ydl_opts(url, cookiefile)
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
             audio_url = info.get("url")
             platform  = info.get("extractor_key")
-            if not audio_url:
-                raise RuntimeError("audio_url_not_found")
 
-        # 2) baixa arquivo (OpenAI precisa de arquivo)
-        audio_path = _download_to_tmp(audio_url)
+        # 2) tenta baixar com requests + headers corretos
+        audio_path: Optional[str] = None
+        if audio_url:
+            headers = _requests_headers_for(info, url)
+            try:
+                audio_path = _download_to_tmp_via_requests(audio_url, headers)
+            except Exception:
+                audio_path = None  # fallback
 
-        # 3) manda para Whisper (OpenAI)
+        # 3) fallback: deixa o yt_dlp baixar o arquivo
+        if not audio_path:
+            audio_path = _download_to_tmp_fallback_with_ytdlp(url, ydl_opts)
+
+        # 4) Transcreve (Whisper)
         if not oai_client:
             raise RuntimeError("openai_client_not_initialized")
 
@@ -217,7 +286,6 @@ def script():
     if not oai_client:
         return _json_error("openai_client_not_initialized", 500)
 
-    # Prompt simples; ajuste como quiser
     prompt = f"""
 Gere um roteiro curto e direto no estilo "{style}" a partir desta transcrição.
 - 5–12 falas curtas
@@ -227,7 +295,7 @@ Gere um roteiro curto e direto no estilo "{style}" a partir desta transcrição.
 
 Transcrição:
 {transcript}
-"""
+""".strip()
 
     try:
         resp = oai_client.chat.completions.create(
