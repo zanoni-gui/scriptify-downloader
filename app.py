@@ -6,7 +6,7 @@ import re
 import json
 import tempfile
 import traceback
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs, urlencode
 from typing import Optional, Dict, Any, List
 
 from flask import Flask, request, jsonify
@@ -19,6 +19,10 @@ OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "")
 ALLOW_ORIGIN     = os.getenv("CORS_ALLOW_ORIGIN", "*")
 MAX_DOWNLOAD_MB  = int(os.getenv("MAX_DOWNLOAD_MB", "80"))           # limite de download para o áudio (MB)
 FORCE_YTDLP_DL   = os.getenv("FORCE_YTDLP_DOWNLOAD", "false").lower() == "true"  # força fallback direto no yt-dlp
+
+# Proxy (opcional). Ex.: http://user:pass@host:port
+GLOBAL_PROXY_URL = os.getenv("GLOBAL_PROXY_URL", "") or os.getenv("HTTP_PROXY", "")
+YTDLP_PROXY_URL  = os.getenv("YTDLP_PROXY_URL", "") or GLOBAL_PROXY_URL
 
 # OpenAI (SDK 1.x)
 try:
@@ -47,6 +51,44 @@ def _canonical_host(host: str) -> str:
     if h == "vm.tiktok.com" or h == "m.tiktok.com" or h.endswith(".tiktok.com"):
         return "tiktok.com"
     return h
+
+def _normalize_youtube_url(u: str) -> str:
+    """
+    Converte /shorts/ID para /watch?v=ID e remove params problemáticos (si, pp, feature, etc).
+    """
+    try:
+        p = urlparse(u)
+        host = _canonical_host(p.netloc)
+        if host != "youtube.com":
+            return u
+
+        path = p.path or ""
+        q = parse_qs(p.query or "", keep_blank_values=False)
+
+        # youtu.be/ID -> watch?v=ID
+        if p.netloc.lower().startswith("youtu.be"):
+            vid = path.strip("/").split("/")[0]
+            if vid:
+                q = {"v": [vid]}
+                return f"https://www.youtube.com/watch?{urlencode({k:v[0] for k,v in q.items()})}"
+
+        # /shorts/ID -> watch?v=ID
+        if path.startswith("/shorts/"):
+            vid = path.split("/")[2] if len(path.split("/")) > 2 else path.split("/")[1]
+            vid = vid.strip()
+            if vid:
+                q["v"] = [vid]
+
+        # se já é watch mas com params extras, apenas saneia
+        remove = {"si", "pp", "feature", "embeds_euri", "source_ve_path", "ppclid", "ppid", "ppua"}
+        q = {k: v for k, v in q.items() if k not in remove}
+
+        if "v" in q and q["v"]:
+            return f"https://www.youtube.com/watch?{urlencode({k:v[0] for k,v in q.items()})}"
+
+        return u
+    except Exception:
+        return u
 
 def _json_error(code: str, http=400, detail: str | None = None):
     payload = {"ok": False, "error": code}
@@ -123,15 +165,17 @@ def _build_ydl_opts(url: str, cookiefile: str | None):
     host = _canonical_host(_domain(url))
     opts = dict(COMMON_YDL)
 
+    # Proxy do yt-dlp (se configurado)
+    if YTDLP_PROXY_URL:
+        opts["proxy"] = YTDLP_PROXY_URL
+
     # YouTube
     if host == "youtube.com":
         ea = opts.setdefault("extractor_args", {}).setdefault("youtube", {})
-        # Emular vários clients ajuda a evitar 403/challenges:
         ea.setdefault("player_client", ["android", "ios", "tvhtml5", "web"])
         # Preferir M4A primeiro (mais estável p/ Whisper):
         opts["format"] = "bestaudio[ext=m4a]/bestaudio/best"
         opts["nocheckcertificate"] = True
-        # Referer exato do vídeo + Origin
         opts["http_headers"].update({
             "Origin":  "https://www.youtube.com",
             "Referer": url,  # watch URL exato
@@ -176,9 +220,6 @@ _SRT_IDX = re.compile(r"^\d+\s*$")
 _SRT_TS = re.compile(r"^\d{2}:\d{2}:\d{2},\d{3}\s-->\s\d{2}:\d{2}:\d{2},\d{3}")
 
 def _pick_caption_track(info: dict) -> Optional[str]:
-    """
-    Retorna a URL de uma trilha de legendas (subtitles/automatic_captions) priorizando PT/EN/ES.
-    """
     def collect(tracks: dict) -> List[dict]:
         items = []
         if isinstance(tracks, dict):
@@ -192,11 +233,8 @@ def _pick_caption_track(info: dict) -> Optional[str]:
 
     subs = collect(info.get("subtitles"))
     autos = collect(info.get("automatic_captions"))
-
-    # preferir subtitles (legenda enviada), depois auto
     pool = subs + autos
 
-    # ordenar por nossa preferência de linguagem e por ext "vtt" primeiro
     def score(it):
         lang = (it.get("_lang") or "").lower()
         try:
@@ -208,7 +246,6 @@ def _pick_caption_track(info: dict) -> Optional[str]:
         return (pref, ext_score)
 
     pool.sort(key=score)
-
     for it in pool:
         url = it.get("url")
         if url:
@@ -219,16 +256,11 @@ def _vtt_to_text(vtt: str) -> str:
     out = []
     for line in vtt.splitlines():
         line = line.strip()
-        if not line:
-            continue
-        if line.startswith("WEBVTT"):
-            continue
-        if _VTT_TS.match(line):
-            continue
-        # Remove tags estilizadas <c> </c> etc
+        if not line: continue
+        if line.startswith("WEBVTT"): continue
+        if _VTT_TS.match(line): continue
         line = re.sub(r"<[^>]+>", "", line)
         out.append(line)
-    # compactar cues repetidos
     txt = "\n".join(out)
     txt = re.sub(r"\n{3,}", "\n\n", txt)
     return txt.strip()
@@ -237,27 +269,25 @@ def _srt_to_text(srt: str) -> str:
     out = []
     for line in srt.splitlines():
         line = line.strip()
-        if not line:
-            continue
-        if _SRT_IDX.match(line):
-            continue
-        if _SRT_TS.match(line):
-            continue
+        if not line: continue
+        if _SRT_IDX.match(line): continue
+        if _SRT_TS.match(line): continue
         out.append(line)
     txt = "\n".join(out)
     txt = re.sub(r"\n{3,}", "\n\n", txt)
     return txt.strip()
 
 def _download_caption_text(cap_url: str, referer_page: str) -> Optional[str]:
+    proxies = {"http": GLOBAL_PROXY_URL, "https": GLOBAL_PROXY_URL} if GLOBAL_PROXY_URL else None
     hdrs = {
         "User-Agent": UA,
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
         "Connection": "keep-alive",
-        "Referer": referer_page,      # referer exato do watch
+        "Referer": referer_page,
         "Origin":  "https://www.youtube.com",
     }
-    r = requests.get(cap_url, timeout=60, headers=hdrs)
+    r = requests.get(cap_url, timeout=60, headers=hdrs, proxies=proxies)
     r.raise_for_status()
     ct = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
     body = r.text
@@ -265,16 +295,13 @@ def _download_caption_text(cap_url: str, referer_page: str) -> Optional[str]:
         return _vtt_to_text(body)
     if "srt" in ct:
         return _srt_to_text(body)
-    # alguns endpoints retornam vtt sem content-type
     if "WEBVTT" in body[:100].upper():
         return _vtt_to_text(body)
-    # fallback “cru”
     return body.strip() or None
 
 
 # ======= Download helpers (requests + fallback yt-dlp) =======
 
-# mapa simples content-type -> extensão recomendada
 CT_TO_EXT = {
     "audio/mpeg": "mp3",
     "audio/mp3": "mp3",
@@ -284,13 +311,13 @@ CT_TO_EXT = {
     "audio/ogg": "ogg",
     "audio/opus": "ogg",
     "audio/webm": "webm",
-    "video/mp4": "mp4",     # Whisper aceita mp4
+    "video/mp4": "mp4",
     "video/webm": "webm",
     "application/octet-stream": None,
     "binary/octet-stream": None,
     "text/plain": None,
-    "application/vnd.apple.mpegurl": "m3u8",  # playlist HLS
-    "application/x-mpegURL": "m3u8",         # playlist HLS
+    "application/vnd.apple.mpegurl": "m3u8",
+    "application/x-mpegURL": "m3u8",
 }
 
 def _guess_ext_from_url(u: str) -> Optional[str]:
@@ -335,23 +362,20 @@ def _requests_headers_for(info: dict, page_url: str) -> dict:
             "Sec-Fetch-Dest":   "video",
         })
     elif host == "youtube.com":
-        # Referer deve ser o watch URL exato para evitar 403 em googlevideo
         hdrs.update({
-            "Referer": page_url,
+            "Referer": page_url,  # watch URL exato
             "Origin":  "https://www.youtube.com",
         })
 
-    # Mescla headers que o yt-dlp expuser (às vezes ajuda)
     if isinstance(info, dict) and isinstance(info.get("http_headers"), dict):
         hdrs.update(info["http_headers"])
 
     return hdrs
 
 def _download_to_tmp_via_requests(audio_url: str, headers: dict, max_mb: int = MAX_DOWNLOAD_MB) -> str:
-    """Baixa direto; se detectar HLS/playlist, força fallback yt-dlp. Salva com extensão aceita pelo Whisper."""
-    with requests.get(audio_url, stream=True, timeout=90, headers=headers) as r:
+    proxies = {"http": GLOBAL_PROXY_URL, "https": GLOBAL_PROXY_URL} if GLOBAL_PROXY_URL else None
+    with requests.get(audio_url, stream=True, timeout=90, headers=headers, proxies=proxies) as r:
         r.raise_for_status()
-
         ct = r.headers.get("Content-Type", "").split(";")[0].strip().lower()
         ext = _guess_ext(ct, audio_url)
         if ext == "m3u8" or ct in ("application/vnd.apple.mpegurl", "application/x-mpegurl"):
@@ -375,12 +399,13 @@ def _download_to_tmp_via_requests(audio_url: str, headers: dict, max_mb: int = M
     return tmp_path
 
 def _download_to_tmp_fallback_with_ytdlp(page_url: str, ydl_opts: dict) -> str:
-    """Se o link direto falhar, deixa o yt-dlp baixar o arquivo (melhor para 403/HLS)."""
     outdir = tempfile.gettempdir()
     ydl_opts = dict(ydl_opts)
     ydl_opts["paths"] = {"home": outdir}
     ydl_opts["outtmpl"] = os.path.join(outdir, "sfy-dl-%(id)s.%(ext)s")
     ydl_opts["noplaylist"] = True
+    if YTDLP_PROXY_URL:
+        ydl_opts["proxy"] = YTDLP_PROXY_URL
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(page_url, download=True)
@@ -401,15 +426,9 @@ def health():
 
 @app.post("/cookies/set")
 def set_cookies():
-    """
-    Define cookies Netscape manualmente.
-    Body: { cookies: str, domains?: [ "youtube.com", "instagram.com", "tiktok.com", ... ] }
-    Se 'domains' não for enviado, aplica para youtube/instagram/tiktok.
-    """
     data = request.get_json(force=True, silent=True) or {}
     cookies_text = (data.get("cookies") or "").strip()
     domains_in = data.get("domains") or ["youtube.com", "instagram.com", "tiktok.com"]
-
     if not cookies_text:
         return _json_error("missing_cookies", 400)
 
@@ -431,11 +450,14 @@ def transcribe():
     Ret:  { ok: true, transcript: { text: str }, platform?: str }
     """
     data = request.get_json(force=True, silent=True) or {}
-    url = (data.get("url") or "").strip()
+    raw_url = (data.get("url") or "").strip()
     cookies_text = data.get("cookies")
 
-    if not url:
+    if not raw_url:
         return _json_error("invalid_url", 400)
+
+    # Normaliza Shorts -> watch
+    url = _normalize_youtube_url(raw_url)
 
     cookiefile = _cookies_for(url, cookies_text)
 
@@ -452,7 +474,7 @@ def transcribe():
 
         _log("extracted", platform, "audio_url exists:", bool(audio_url))
 
-        # 1.5) TENTAR LEGENDAS (YouTube) ANTES DE TUDO
+        # 1.5) Tenta legendas (YouTube) antes de baixar mídia
         if host_can == "youtube.com":
             cap_url = _pick_caption_track(info or {})
             if cap_url:
@@ -527,10 +549,6 @@ def transcribe():
 
 @app.post("/script")
 def script():
-    """
-    Body: { transcript: str, style?: str }
-    Ret:  { ok: true, script: str }
-    """
     data = request.get_json(force=True, silent=True) or {}
     transcript = (data.get("transcript") or "").strip()
     style = (data.get("style") or "tiktok-narrativo").strip()
@@ -553,15 +571,24 @@ Transcrição:
 """.strip()
 
     try:
+        resp = oai_client.chat_completions.create(  # compat c/ SDKs recentes
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+        )
+    except AttributeError:
+        # SDK 1.x (nome antigo):
         resp = oai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.7,
         )
+
+    try:
         text = resp.choices[0].message.content.strip()
         return _json_ok({"script": text})
     except Exception as e:
-        _log("script error:", repr(e))
+        _log("script parse error:", repr(e))
         return _json_error("script_failed", 500, detail=str(e))
 
 
