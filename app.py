@@ -1,10 +1,12 @@
 # app.py
 import os
+import sys
 import time
+import json
 import tempfile
 import traceback
 from urllib.parse import urlparse
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -12,9 +14,10 @@ import requests
 import yt_dlp
 
 # ============== Config =================
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-ALLOW_ORIGIN   = os.getenv("CORS_ALLOW_ORIGIN", "*")
-MAX_DOWNLOAD_MB = int(os.getenv("MAX_DOWNLOAD_MB", "80"))   # limite de download para o áudio (MB)
+OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "")
+ALLOW_ORIGIN     = os.getenv("CORS_ALLOW_ORIGIN", "*")
+MAX_DOWNLOAD_MB  = int(os.getenv("MAX_DOWNLOAD_MB", "80"))           # limite de download para o áudio (MB)
+FORCE_YTDLP_DL   = os.getenv("FORCE_YTDLP_DOWNLOAD", "false").lower() == "true"  # força fallback direto no yt-dlp
 
 # OpenAI (SDK 1.x)
 try:
@@ -43,9 +46,12 @@ def _json_ok(data: dict, http=200):
     data = {"ok": True, **data}
     return jsonify(data), http
 
+def _log(*args):
+    print("[scriptfy]", *args, file=sys.stderr, flush=True)
+
 
 # ======= Cookies: cache simples por domínio =======
-COOKIES_CACHE = {}  # { domain: {"path": "...", "text": "...", "ts": epoch} }
+COOKIES_CACHE: Dict[str, Dict[str, Any]] = {}  # { domain: {"path": "...", "text": "...", "ts": epoch} }
 COOKIES_TTL   = 24 * 60 * 60  # 24h
 
 def _save_cookies_text(cookies_text: str | None) -> str | None:
@@ -54,7 +60,7 @@ def _save_cookies_text(cookies_text: str | None) -> str | None:
         return None
     path = os.path.join(tempfile.gettempdir(), "sfy-cookies.txt")
     with open(path, "w", encoding="utf-8") as f:
-        f.write(cookies_text.strip() + "\n")
+        f.write(cookies_text.strip().replace("\r\n", "\n").replace("\r", "\n") + "\n")
     return path
 
 def _cookies_for(url: str, incoming_text: str | None) -> str | None:
@@ -65,6 +71,7 @@ def _cookies_for(url: str, incoming_text: str | None) -> str | None:
     if incoming_text and incoming_text.strip():
         path = _save_cookies_text(incoming_text)
         COOKIES_CACHE[dom] = {"path": path, "text": incoming_text, "ts": now}
+        _log(f"cookies set for {dom}, file={path}")
         return path
 
     # senão, tenta cache existente
@@ -76,6 +83,12 @@ def _cookies_for(url: str, incoming_text: str | None) -> str | None:
 
 
 # ======= yt-dlp options por host =======
+UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/123.0 Safari/537.36"
+)
+
 COMMON_YDL = {
     "quiet": True,
     "no_warnings": True,
@@ -85,12 +98,12 @@ COMMON_YDL = {
     "concurrent_fragment_downloads": 3,
     "outtmpl": os.path.join(tempfile.gettempdir(), "sfy-%(id)s.%(ext)s"),
     "format": "bestaudio/best",
+    "hls_prefer_native": True,
     "http_headers": {
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/123.0 Safari/537.36"
-        )
+        "User-Agent": UA,
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "keep-alive",
     },
 }
 
@@ -98,18 +111,37 @@ def _build_ydl_opts(url: str, cookiefile: str | None):
     host = _domain(url)
     opts = dict(COMMON_YDL)
 
+    # YouTube
     if "youtube.com" in host or "youtu.be" in host:
-        # melhora taxa de sucesso sem login (ainda pode pedir cookies)
         opts.setdefault("extractor_args", {}) \
             .setdefault("youtube", {}) \
             .setdefault("player_client", ["android", "web"])
         opts["nocheckcertificate"] = True
+        # alguns endpoints HLS retornam melhor com estes cabeçalhos
+        opts["http_headers"].update({
+            "Origin":  "https://www.youtube.com",
+            "Referer": "https://www.youtube.com/",
+        })
 
+    # Instagram
     if "instagram.com" in host:
-        # IG costuma exigir cookies mesmo; isso só ajuda metadados
         opts.setdefault("extractor_args", {}) \
             .setdefault("instagram", {}) \
             .setdefault("approximate_date", ["True"])
+        opts["http_headers"].update({
+            "Origin":           "https://www.instagram.com",
+            "Referer":          "https://www.instagram.com/",
+            "Sec-Fetch-Site":   "same-origin",
+            "Sec-Fetch-Mode":   "navigate",
+            "Sec-Fetch-Dest":   "video",
+        })
+
+    # TikTok
+    if "tiktok.com" in host:
+        opts["http_headers"].update({
+            "Origin":  "https://www.tiktok.com",
+            "Referer": "https://www.tiktok.com/",
+        })
 
     if cookiefile:
         opts["cookiefile"] = cookiefile
@@ -120,25 +152,41 @@ def _build_ydl_opts(url: str, cookiefile: str | None):
 # ======= Download helpers (requests + fallback yt-dlp) =======
 def _requests_headers_for(info: dict, page_url: str) -> dict:
     hdrs = {
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/123.0 Safari/537.36"
-        )
+        "User-Agent": UA,
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "keep-alive",
     }
     host = _domain(page_url)
-    # TikTok frequentemente exige Referer/Origin
+
+    # browser-like headers por host
     if "tiktok.com" in host:
         hdrs["Referer"] = "https://www.tiktok.com/"
         hdrs["Origin"]  = "https://www.tiktok.com"
-    # Se o yt-dlp expôs headers (às vezes traz cookies/UA), aproveita
+    elif "instagram.com" in host:
+        hdrs.update({
+            "Referer":          "https://www.instagram.com/",
+            "Origin":           "https://www.instagram.com",
+            "Sec-Fetch-Site":   "same-origin",
+            "Sec-Fetch-Mode":   "navigate",
+            "Sec-Fetch-Dest":   "video",
+        })
+    elif "youtube.com" in host or "youtu.be" in host:
+        hdrs.update({
+            "Referer": "https://www.youtube.com/",
+            "Origin":  "https://www.youtube.com",
+        })
+
+    # Se o yt-dlp expôs headers úteis, mescla
     if isinstance(info, dict) and isinstance(info.get("http_headers"), dict):
         hdrs.update(info["http_headers"])
+
     return hdrs
+
 
 def _download_to_tmp_via_requests(audio_url: str, headers: dict, max_mb: int = MAX_DOWNLOAD_MB) -> str:
     tmp_path = os.path.join(tempfile.gettempdir(), f"sfy-audio-{int(time.time()*1000)}.bin")
-    with requests.get(audio_url, stream=True, timeout=60, headers=headers) as r:
+    with requests.get(audio_url, stream=True, timeout=90, headers=headers) as r:
         r.raise_for_status()
         size_mb = 0.0
         with open(tmp_path, "wb") as f:
@@ -151,8 +199,12 @@ def _download_to_tmp_via_requests(audio_url: str, headers: dict, max_mb: int = M
                     raise RuntimeError("audio_too_large")
     return tmp_path
 
+
 def _download_to_tmp_fallback_with_ytdlp(page_url: str, ydl_opts: dict) -> str:
-    """Se o link direto falhar, deixa o yt-dlp baixar o arquivo."""
+    """
+    Se o link direto falhar, deixa o yt-dlp baixar o arquivo.
+    Menos suscetível a 403/HLS, mas pode requerer ffmpeg no build.
+    """
     outdir = tempfile.gettempdir()
     ydl_opts = dict(ydl_opts)
     ydl_opts["paths"] = {"home": outdir}
@@ -163,7 +215,7 @@ def _download_to_tmp_fallback_with_ytdlp(page_url: str, ydl_opts: dict) -> str:
         info = ydl.extract_info(page_url, download=True)
         path = ydl.prepare_filename(info)
         if not os.path.exists(path):
-            # tenta pegar o arquivo mais recente começando com sfy-dl-
+            # pega o arquivo mais recente começando com sfy-dl-
             candidates = [os.path.join(outdir, f) for f in os.listdir(outdir) if f.startswith("sfy-dl-")]
             if not candidates:
                 raise RuntimeError("download_file_missing")
@@ -176,6 +228,7 @@ def _download_to_tmp_fallback_with_ytdlp(page_url: str, ydl_opts: dict) -> str:
 @app.get("/health")
 def health():
     return "ok", 200
+
 
 @app.post("/cookies/set")
 def set_cookies():
@@ -196,7 +249,9 @@ def set_cookies():
     for d in domains:
         COOKIES_CACHE[d] = {"path": path, "text": cookies_text, "ts": now}
 
+    _log(f"/cookies/set ok for {domains}, file={path}")
     return _json_ok({"saved_for": domains})
+
 
 @app.post("/transcribe")
 def transcribe():
@@ -216,23 +271,30 @@ def transcribe():
     try:
         # 1) resolve URL do áudio (sem baixar)
         ydl_opts = _build_ydl_opts(url, cookiefile)
+        _log("ydl_opts for", _domain(url), json.dumps(ydl_opts.get("http_headers", {})))
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
             audio_url = info.get("url")
             platform  = info.get("extractor_key")
 
-        # 2) tenta baixar com requests + headers corretos
+        _log("extracted", platform, "audio_url exists:", bool(audio_url))
+
         audio_path: Optional[str] = None
-        if audio_url:
+
+        # Se não for forçado a usar o yt-dlp, tenta primeiro via requests com headers "browser-like"
+        if not FORCE_YTDLP_DL and audio_url:
             headers = _requests_headers_for(info, url)
             try:
                 audio_path = _download_to_tmp_via_requests(audio_url, headers)
-            except Exception:
+                _log("download via requests ok:", audio_path)
+            except Exception as e:
+                _log("requests download failed:", repr(e))
                 audio_path = None  # fallback
 
-        # 3) fallback: deixa o yt_dlp baixar o arquivo
+        # Fallback: deixa o ytdlp baixar o arquivo (mais resiliente)
         if not audio_path:
             audio_path = _download_to_tmp_fallback_with_ytdlp(url, ydl_opts)
+            _log("download via ytdlp ok:", audio_path)
 
         # 4) Transcreve (Whisper)
         if not oai_client:
@@ -252,23 +314,28 @@ def transcribe():
     except yt_dlp.utils.DownloadError as e:
         msg = str(e)
         host = _domain(url)
-        if "Sign in" in msg or "login" in msg or "cookies" in msg:
+        _log("DownloadError:", msg)
+        if any(s in msg for s in ("Sign in", "login", "cookies", "HTTP Error 403")):
             code = "auth_required_youtube" if ("youtube" in host or "youtu.be" in host) \
                    else ("auth_required_instagram" if "instagram" in host else "auth_required")
             return _json_error(code, 402)
         return _json_error("download_failed", 502, detail=msg)
 
     except requests.HTTPError as e:
+        _log("HTTPError:", repr(e))
         return _json_error("audio_fetch_failed", 502, detail=str(e))
 
     except RuntimeError as e:
         code = str(e)
+        _log("RuntimeError:", code)
         if code == "audio_too_large":
             return _json_error("audio_too_large", 413, "Arquivo de áudio excedeu o limite.")
         return _json_error("transcribe_failed", 500, detail=str(e))
 
     except Exception as e:
+        _log("Exception:", traceback.format_exc())
         return _json_error("transcribe_failed", 500, detail=traceback.format_exc())
+
 
 @app.post("/script")
 def script():
@@ -306,6 +373,7 @@ Transcrição:
         text = resp.choices[0].message.content.strip()
         return _json_ok({"script": text})
     except Exception as e:
+        _log("script error:", repr(e))
         return _json_error("script_failed", 500, detail=str(e))
 
 
